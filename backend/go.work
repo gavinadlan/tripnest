@@ -1,0 +1,12 @@
+go 1.24.0
+
+use (
+	./api-gateway
+	./booking-service
+	./common
+	./notification-service
+	./payment-service
+	./recommendation-service
+	./search-service
+	./user-service
+)
