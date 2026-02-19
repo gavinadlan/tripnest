@@ -1,44 +1,119 @@
 # TripNest: Distributed Travel Booking System
 
-TripNest is a distributed system designed to handle high-concurrency travel bookings with a resilient, event-driven architecture.
+A scalable, event-driven microservices architecture for travel booking, built with Go, Kafka, and PostgreSQL.
 
-## Architecture Highlights
-- **Microservices**: Decoupled services with single responsibility.
-- **Event-Driven**: Kafka for asynchronous communication and choreography-based Sagas.
-- **Polyglot Persistence**: PostgreSQL for transactional data, MongoDB for search/analytics.
-- **Scalability**: Stateless services, horizontal scaling, caching with Redis.
-- **Frontend**: Minimal Next.js UI using REST APIs.
+## Architecture Overview
 
-## Tech Stack
-- **Backend**: Go (Golang)
-- **Database**: PostgreSQL, MongoDB, Redis
-- **Messaging**: Kafka
-- **Infrastructure**: Docker, Docker Compose
-- **Frontend**: Next.js, TailwindCSS
+TripNest demonstrates a modern distributed system using **Choreography-based Sagas** for data consistency across services. It is designed to handle high concurrency and potential partial failures gracefully.
 
-## Service Breakdown
+### Core Services
 
-| Service | Status | Tech | Responsibility |
+| Service | Status | Tech Stack | Responsibility |
 | :--- | :--- | :--- | :--- |
-| **User Service** | ✅ Done | Go, PostgreSQL | User management, Authentication (JWT), Clean Architecture. |
-| **Search Service** | 🚧 Pending | Go, MongoDB, Redis | High-performance flight/hotel search. |
-| **Booking Service** | ✅ Done | Go, PostgreSQL, Kafka | Order management, Booking state machine. |
-| **Payment Service** | 🚧 Pending | Go, PostgreSQL, Kafka | Payment processing, Idempotency. |
-| **Notification Service** | 🚧 Pending | Go, Kafka Consumer | Async notifications (Email/SMS). |
-| **Recommendation Service** | 🚧 Pending | Go, MongoDB | Personalized travel suggestions. |
-| **API Gateway** | 🚧 Pending | Nginx / Go | Entry point, Rate limiting. |
+| **User Service** | ✅ Completed | Go, PostgreSQL, JWT | User registration, authentication, and secure password handling. |
+| **Booking Service** | ✅ Completed | Go, PostgreSQL, Kafka | Order management, state machine (PENDING → CONFIRMED/CANCELLED). |
+| **Payment Service** | ✅ Completed | Go, PostgreSQL, Kafka | Payment processing, idempotency, event publishing. |
+| **Search Service** | 🚧 Planned | Go, MongoDB, Redis | High-performance search optimized for read-heavy workloads. |
 
-## Event Choreography (Saga Pattern)
-We use a decentralized choreography-based Saga to manage distributed transactions.
-1.  **Booking Created** -> `booking.created`
-2.  **Payment Processed** -> `payment.success` / `payment.failed`
-3.  **Booking Completed** -> `booking.confirmed` / `booking.cancelled`
-4.  **Notification Sent** -> `notification.sent`
+### Event Choreography (Saga Pattern)
 
-## Setup & Running
-*(Instructions to run with Docker Compose will be added here)*
+The system uses asynchronous messaging via Apache Kafka to coordinate cross-service transactions without a central orchestrator.
 
-## Project Structure
-This is a monorepo containing:
-- `backend/`: Go microservices using Go Workspaces.
-- `frontend/`: Next.js frontend application.
+```mermaid
+sequenceDiagram
+    participant User
+    participant Booking Service
+    participant Kafka (booking.created)
+    participant Payment Service
+    participant Kafka (payment.success/failed)
+
+    User->>Booking Service: POST /bookings (Create Booking)
+    Booking Service->>Booking Service: Save Booking (PENDING)
+    Booking Service->>Kafka (booking.created): Publish Event
+    Kafka (booking.created)->>Payment Service: Consume Event
+    Payment Service->>Payment Service: Process Payment
+    alt Payment Success
+        Payment Service->>Kafka (payment.success/failed): Publish payment.success
+        Kafka (payment.success/failed)->>Booking Service: Consume Event
+        Booking Service->>Booking Service: Update Status (CONFIRMED)
+    else Payment Failed
+        Payment Service->>Kafka (payment.success/failed): Publish payment.failed
+        Kafka (payment.success/failed)->>Booking Service: Consume Event
+        Booking Service->>Booking Service: Update Status (CANCELLED)
+    end
+```
+
+### Booking State Machine
+
+1.  **PENDING**: Initial state upon booking creation.
+2.  **CONFIRMED**: Transitioned when `payment.success` event is received.
+3.  **CANCELLED**: Transitioned when `payment.failed` event is received or timeout occurs.
+
+## Engineering Decisions
+
+### Choreography-based Saga
+We chose choreography over orchestration to decouple services. Each service reacts to events independently, reducing the single point of failure risk associated with centralized orchestrators.
+
+### Idempotency
+The Payment Service implements idempotency by using a unique constraint on the `booking_id`. Duplicate `booking.created` events are safely ignored, preventing double charges.
+
+### Statelessness & Scalability
+All services are stateless and containerized. Authentication is handled via stateless JWTs. This allows horizontal scaling of any service (e.g., running multiple replicas of the Booking Service consumer group) without session affinity issues.
+
+### Kafka as Backbone
+Kafka provides the durability and replayability needed for reliable event sourcing. It ensures that even if a service is temporarily down, events are not lost and can be processed once the service recovers.
+
+## Setup Instructions
+
+### Prerequisites
+*   Docker & Docker Compose
+*   Go 1.24+ (for local development)
+
+### Running the System
+
+1.  **Build and Start Services**
+    ```bash
+    docker compose build --no-cache
+    docker compose up -d
+    ```
+
+2.  **Verify Services**
+    *   User Service: `http://localhost:8080`
+    *   Booking Service: `http://localhost:8081`
+    *   Payment Service: `http://localhost:8082`
+
+3.  **Check Logs**
+    ```bash
+    docker logs -f tripnest-booking-service
+    ```
+
+## API Testing (End-to-End Flow)
+
+### 1. Register User
+```bash
+curl -X POST http://localhost:8080/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com", "password":"password123", "first_name":"John", "last_name":"Doe"}'
+```
+
+### 2. Login (Get Token)
+```bash
+curl -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com", "password":"password123"}'
+```
+
+### 3. Create Booking
+```bash
+# This triggers the Saga: Booking Created -> Payment Processed -> Booking Confirmed
+curl -X POST http://localhost:8081/bookings \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"<USER_ID_FROM_STEP_1>", "resource_id":"flight-101", "total_amount": 250.00}'
+```
+
+### 4. Check Booking Status
+Wait a few seconds for the async process to complete, then check the status:
+```bash
+curl http://localhost:8081/bookings/<BOOKING_ID_FROM_STEP_3>
+```
+Expected Output: `{"status": "CONFIRMED", ...}`
