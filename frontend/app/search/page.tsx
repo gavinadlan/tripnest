@@ -65,11 +65,16 @@ export default function SearchPage() {
         }
 
         try {
-            await bookingApi.post('/bookings', {
+            const response = await bookingApi.post('/bookings', {
                 user_id: userId,
                 resource_id: listing.id,
                 total_amount: listing.price
             });
+
+            const existingBookings = JSON.parse(localStorage.getItem('my_bookings') || '[]');
+            existingBookings.push(response.data.id);
+            localStorage.setItem('my_bookings', JSON.stringify(existingBookings));
+
             alert('Booking created successfully!');
             router.push('/bookings');
         } catch (error: any) {
