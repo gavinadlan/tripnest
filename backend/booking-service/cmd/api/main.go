@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/config"
@@ -52,6 +53,17 @@ func main() {
 	h := handler.NewHandler(svc)
 
 	r := chi.NewRouter()
+
+	// CORS Setup
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:3000"}, // Frontend URL
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
