@@ -46,6 +46,20 @@ services:
       timeout: 5s
       retries: 5
 
+  mongo:
+    image: mongo:6.0
+    container_name: tripnest-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - tripnest_mongodata:/data/db
+
+  redis:
+    image: redis:7.0-alpine
+    container_name: tripnest-redis
+    ports:
+      - "6379:6379"
+
   user-service:
     build:
       context: ./backend
@@ -94,5 +108,23 @@ services:
       kafka:
         condition: service_healthy
 
+  search-service:
+    build:
+      context: ./backend
+      dockerfile: search-service/Dockerfile
+    container_name: tripnest-search-service
+    ports:
+      - "8083:8083"
+    environment:
+      PORT: 8083
+      MONGO_URI: mongodb://mongo:27017/tripnest_search
+      REDIS_ADDR: redis:6379
+    depends_on:
+      mongo:
+        condition: service_started
+      redis:
+        condition: service_started
+
 volumes:
   tripnest_pgdata:
+  tripnest_mongodata:
