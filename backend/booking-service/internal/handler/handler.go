@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"log"
 	"net/http"
 
@@ -33,7 +34,7 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 
 	// Validate (simple)
 	if req.UserID == "" || req.ResourceID == "" || req.TotalAmount <= 0 {
-		utils.WriteError(w, http.StatusBadRequest, nil) // Should pass error message
+		utils.WriteError(w, http.StatusBadRequest, errors.New("invalid booking request: missing required fields"))
 		return
 	}
 
@@ -50,7 +51,7 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetBooking(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
-		utils.WriteError(w, http.StatusBadRequest, nil)
+		utils.WriteError(w, http.StatusBadRequest, errors.New("missing booking id"))
 		return
 	}
 
@@ -60,7 +61,7 @@ func (h *Handler) GetBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if booking == nil {
-		utils.WriteError(w, http.StatusNotFound, nil)
+		utils.WriteError(w, http.StatusNotFound, errors.New("booking not found"))
 		return
 	}
 
