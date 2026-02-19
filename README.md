@@ -13,7 +13,7 @@ TripNest demonstrates a modern distributed system using **Choreography-based Sag
 | **User Service** | ✅ Completed | Go, PostgreSQL, JWT | User registration, authentication, and secure password handling. |
 | **Booking Service** | ✅ Completed | Go, PostgreSQL, Kafka | Order management, state machine (PENDING → CONFIRMED/CANCELLED). |
 | **Payment Service** | ✅ Completed | Go, PostgreSQL, Kafka | Payment processing, idempotency, event publishing. |
-| **Search Service** | 🚧 Planned | Go, MongoDB, Redis | High-performance search optimized for read-heavy workloads. |
+| **Search Service** | ✅ Completed | Go, MongoDB, Redis | High-performance search optimized for read-heavy workloads. |
 
 ### Event Choreography (Saga Pattern)
 
@@ -63,6 +63,9 @@ All services are stateless and containerized. Authentication is handled via stat
 ### Kafka as Backbone
 Kafka provides the durability and replayability needed for reliable event sourcing. It ensures that even if a service is temporarily down, events are not lost and can be processed once the service recovers.
 
+### Search Optimization (CQRS-lite)
+The Search Service uses MongoDB for flexible schema queries and Redis for caching frequent search results. This separates the read-heavy load from the transactional PostgreSQL databases used by User and Booking services.
+
 ## Setup Instructions
 
 ### Prerequisites
@@ -81,6 +84,7 @@ Kafka provides the durability and replayability needed for reliable event sourci
     *   User Service: `http://localhost:8080`
     *   Booking Service: `http://localhost:8081`
     *   Payment Service: `http://localhost:8082`
+    *   Search Service: `http://localhost:8083`
 
 3.  **Check Logs**
     ```bash
@@ -117,3 +121,13 @@ Wait a few seconds for the async process to complete, then check the status:
 curl http://localhost:8081/bookings/<BOOKING_ID_FROM_STEP_3>
 ```
 Expected Output: `{"status": "CONFIRMED", ...}`
+
+### 5. Search Listings (Search Service)
+First, seed the database:
+```bash
+curl -X POST http://localhost:8083/seed
+```
+Then search:
+```bash
+curl "http://localhost:8083/search?destination=Paris&min_price=100&max_price=500"
+```
