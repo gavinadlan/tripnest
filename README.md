@@ -91,6 +91,22 @@ The Search Service uses MongoDB for flexible schema queries and Redis for cachin
     docker logs -f tripnest-booking-service
     ```
 
+### Frontend Setup
+
+1.  **Install Dependencies**
+    ```bash
+    cd frontend
+    npm install
+    ```
+
+2.  **Run Development Server**
+    ```bash
+    npm run dev
+    ```
+
+3.  **Access the UI**
+    Open `http://localhost:3000` in your browser.
+
 ## API Testing (End-to-End Flow)
 
 ### 1. Register User
