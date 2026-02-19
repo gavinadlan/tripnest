@@ -1,6 +1,6 @@
 module github.com/gavinadlan/tripnest/backend/search-service
 
-go 1.24.0
+go 1.23.4
 
 require (
 	github.com/gavinadlan/tripnest/backend/common v0.0.0
