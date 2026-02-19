@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/db"
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/events"
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/handler"
+	"github.com/gavinadlan/tripnest/backend/booking-service/internal/model"
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/repository"
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/service"
 )
@@ -38,6 +40,15 @@ func main() {
 	defer producer.Close()
 
 	svc := service.NewBookingService(repo, producer)
+
+	// Payment Success Consumer
+	paymentSuccessConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.success", "booking-service-group")
+	defer paymentSuccessConsumer.Close()
+
+	// Payment Failed Consumer
+	paymentFailedConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.failed", "booking-service-group")
+	defer paymentFailedConsumer.Close()
+
 	h := handler.NewHandler(svc)
 
 	r := chi.NewRouter()
@@ -51,6 +62,52 @@ func main() {
 		Handler: r,
 	}
 
+	// Start consumers safely
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		log.Println("Listening for payment.success events...")
+		for {
+			msg, err := paymentSuccessConsumer.ReadMessage(ctx)
+			if err != nil {
+				log.Printf("Payment Success Consumer error: %v", err)
+				break
+			}
+
+			var event model.PaymentProcessedEvent
+			if err := json.Unmarshal(msg.Value, &event); err != nil {
+				log.Printf("Failed to unmarshal payment success event: %v", err)
+				continue
+			}
+
+			if err := svc.ConfirmBooking(ctx, event.BookingID); err != nil {
+				log.Printf("Failed to confirm booking %s: %v", event.BookingID, err)
+			}
+		}
+	}()
+
+	go func() {
+		log.Println("Listening for payment.failed events...")
+		for {
+			msg, err := paymentFailedConsumer.ReadMessage(ctx)
+			if err != nil {
+				log.Printf("Payment Failed Consumer error: %v", err)
+				break
+			}
+
+			var event model.PaymentProcessedEvent
+			if err := json.Unmarshal(msg.Value, &event); err != nil {
+				log.Printf("Failed to unmarshal payment failed event: %v", err)
+				continue
+			}
+
+			if err := svc.CancelBooking(ctx, event.BookingID); err != nil {
+				log.Printf("Failed to cancel booking %s: %v", event.BookingID, err)
+			}
+		}
+	}()
+
 	go func() {
 		log.Printf("Booking Service starting on port %s", cfg.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -63,10 +120,10 @@ func main() {
 	<-quit
 	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
 
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 

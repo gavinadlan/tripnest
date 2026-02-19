@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/events"
@@ -13,6 +14,8 @@ import (
 type BookingService interface {
 	CreateBooking(ctx context.Context, req *model.CreateBookingRequest) (*model.Booking, error)
 	GetBooking(ctx context.Context, id string) (*model.Booking, error)
+	ConfirmBooking(ctx context.Context, bookingID string) error
+	CancelBooking(ctx context.Context, bookingID string) error
 }
 
 type bookingService struct {
@@ -44,15 +47,11 @@ func (s *bookingService) CreateBooking(ctx context.Context, req *model.CreateBoo
 		TotalAmount: booking.TotalAmount,
 	}
 
-	// Use background context for async publishing or same context?
-	// Async is better for latency, but we want reliability.Saga logic might require confirmation.
-	// For now, synchronous publish.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.producer.Publish(ctx, "booking.created", booking.ID, event); err != nil {
 			fmt.Printf("Failed to publish booking.created event: %v\n", err)
-			// TODO: Implement outbox pattern or retry
 		}
 	}()
 
@@ -61,4 +60,16 @@ func (s *bookingService) CreateBooking(ctx context.Context, req *model.CreateBoo
 
 func (s *bookingService) GetBooking(ctx context.Context, id string) (*model.Booking, error) {
 	return s.repo.GetByID(ctx, id)
+}
+
+func (s *bookingService) ConfirmBooking(ctx context.Context, bookingID string) error {
+	log.Printf("Confirming booking %s", bookingID)
+	// Additional logic here: e.g. send confirmation email event
+	return s.repo.UpdateStatus(ctx, bookingID, "CONFIRMED")
+}
+
+func (s *bookingService) CancelBooking(ctx context.Context, bookingID string) error {
+	log.Printf("Cancelling booking %s", bookingID)
+	// Additional logic here: e.g. revert resource reservation
+	return s.repo.UpdateStatus(ctx, bookingID, "CANCELLED")
 }
