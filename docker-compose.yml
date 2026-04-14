@@ -11,15 +11,17 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.8.0
     container_name: tripnest-kafka
+    restart: always
     ports:
       - "9092:9092"
+      - "29092:29092"
     depends_on:
       - zookeeper
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     healthcheck:
@@ -80,10 +82,11 @@ services:
       context: ./backend
       dockerfile: booking-service/Dockerfile
     container_name: tripnest-booking-service
+    restart: always
     ports:
       - "8081:8081"
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_bookings?sslmode=disable
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_booking?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       PORT: 8081
       JWT_SECRET: dev-secret
@@ -98,10 +101,36 @@ services:
       context: ./backend
       dockerfile: payment-service/Dockerfile
     container_name: tripnest-payment-service
+    restart: always
+    ports:
+      - "8082:8082"
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_payments?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       PORT: 8082
+      BOOKING_SERVICE_URL: http://booking-service:8081
+      MIDTRANS_MERCHANT_ID: G249068382
+      MIDTRANS_CLIENT_KEY: ${MIDTRANS_CLIENT_KEY}
+      MIDTRANS_SERVER_KEY: ${MIDTRANS_SERVER_KEY}
+      MIDTRANS_IS_PRODUCTION: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  inventory-service:
+    build:
+      context: ./backend
+      dockerfile: inventory-service/Dockerfile
+    container_name: tripnest-inventory-service
+    restart: always
+    ports:
+      - "8084:8084"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_inventory?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      PORT: 8084
     depends_on:
       postgres:
         condition: service_healthy
