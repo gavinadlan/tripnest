@@ -16,11 +16,18 @@ export default function AdminSidebar() {
   const pathname = usePathname();
 
   return (
-    <aside className="hidden w-64 border-r border-[var(--color-border)] bg-white p-4 lg:block">
-      <h2 className="px-3 py-2 text-sm font-semibold text-[var(--color-text-secondary)]">Dashboard Admin</h2>
+    <aside className="w-64 border-r border-[var(--color-border)] bg-white p-4">
+      <h2 className="px-3 py-2 text-sm font-semibold text-[var(--color-text-secondary)]">
+        Dashboard Admin
+      </h2>
+
       <nav className="mt-2 space-y-1">
         {links.map(({ href, label, icon: Icon }) => {
-          const active = pathname === href;
+          const active =
+            href === '/admin'
+              ? pathname === href
+              : pathname === href || pathname.startsWith(`${href}/`);
+
           return (
             <Link
               key={href}

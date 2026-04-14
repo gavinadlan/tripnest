@@ -1,36 +1,25 @@
-'use client';
-
-import { useEffect } from 'react';
-import { usePathname, useRouter } from 'next/navigation';
+import type { Metadata } from 'next';
+import '../globals.css';
 import AdminSidebar from '@/components/admin/AdminSidebar';
-import AdminTopbar from '@/components/admin/AdminTopbar';
+import AdminNavbar from '@/components/admin/AdminNavbar';
 
-export default function AdminLayout({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname();
-  const router = useRouter();
-  const isLoginPage = pathname === '/admin/login';
-  const isLoggedIn = typeof window !== 'undefined' && localStorage.getItem('admin_logged_in') === 'true';
+export const metadata: Metadata = {
+  title: 'Admin | TripNest',
+};
 
-  useEffect(() => {
-    if (!isLoginPage && !isLoggedIn) {
-      router.replace('/admin/login');
-    }
-  }, [isLoginPage, isLoggedIn, router]);
-
-  if (isLoginPage) {
-    return <>{children}</>;
-  }
-
-  if (!isLoggedIn) {
-    return <p className="p-6 text-sm text-[var(--color-text-secondary)]">Memverifikasi akses admin...</p>;
-  }
-
+export default function AdminLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
-    <div className="flex min-h-screen bg-[var(--color-background)]">
-      <AdminSidebar />
-      <div className="flex flex-1 flex-col">
-        <AdminTopbar />
-        <main className="flex-1 p-6">{children}</main>
+    <div className="flex min-h-screen flex-col bg-[var(--color-background)]">
+      <AdminNavbar />
+      <div className="flex flex-1">
+        <AdminSidebar />
+        <main className="flex-1 p-6">
+          {children}
+        </main>
       </div>
     </div>
   );

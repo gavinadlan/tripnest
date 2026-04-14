@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
@@ -18,7 +18,10 @@ export default function Navbar() {
 
         const syncAuth = () => {
             const token = localStorage.getItem("token");
-            setIsLoggedIn(!!token);
+            const admin = localStorage.getItem("admin_logged_in");
+
+            // 🔥 FIX: support admin + user
+            setIsLoggedIn(!!token || admin === "true");
         };
 
         syncAuth();
@@ -30,8 +33,11 @@ export default function Navbar() {
     const handleLogout = () => {
         localStorage.removeItem("token");
         localStorage.removeItem("user_id");
+        localStorage.removeItem("admin_logged_in"); // 🔥 FIX ADMIN
+
         setIsLoggedIn(false);
         setMobileMenuOpen(false);
+
         router.push("/login");
     };
 
@@ -40,10 +46,9 @@ export default function Navbar() {
         { name: "Pesanan Saya", href: "/my-bookings" },
     ];
 
-    // 🔥 CRITICAL FIX: jangan render sebelum mounted
     if (!mounted) {
         return (
-            <nav className="sticky top-0 z-50 border-b border-[var(--color-border)] bg-white/95 backdrop-blur-md">
+            <nav className="sticky top-0 z-50 border-b bg-white">
                 <div className="mx-auto max-w-7xl px-4 h-16 flex items-center">
                     <span className="text-lg font-bold">TripNest</span>
                 </div>
@@ -52,12 +57,14 @@ export default function Navbar() {
     }
 
     return (
-        <nav className="sticky top-0 z-50 border-b border-[var(--color-border)] bg-white/95 backdrop-blur-md">
+        <nav className="sticky top-0 z-50 border-b bg-white">
             <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
                 <div className="flex h-16 justify-between">
+                    
+                    {/* LOGO */}
                     <div className="flex items-center">
                         <Link href="/" className="flex items-center gap-2">
-                            <div className="rounded-lg bg-[var(--color-primary)] p-2">
+                            <div className="rounded-lg bg-indigo-500 p-2">
                                 <PlaneTakeoff className="h-5 w-5 text-white" />
                             </div>
                             <span className="text-xl font-bold">
@@ -65,6 +72,7 @@ export default function Navbar() {
                             </span>
                         </Link>
 
+                        {/* MENU */}
                         <div className="hidden sm:ml-10 sm:flex sm:space-x-8">
                             {navLinks.map((link) => (
                                 <Link
@@ -82,12 +90,12 @@ export default function Navbar() {
                         </div>
                     </div>
 
-                    {/* 🔥 FIX HYDRATION */}
+                    {/* 🔥 AUTH FIX */}
                     <div className="hidden sm:flex sm:items-center">
                         {isLoggedIn ? (
                             <button
                                 onClick={handleLogout}
-                                className="ml-4 flex items-center gap-2 rounded-lg border px-4 py-2 text-sm"
+                                className="ml-4 flex items-center gap-2 rounded-lg border px-4 py-2 text-sm hover:bg-red-50 hover:text-red-600"
                             >
                                 <LogOut className="h-4 w-4" />
                                 Keluar
@@ -100,16 +108,16 @@ export default function Navbar() {
                         )}
                     </div>
 
+                    {/* MOBILE */}
                     <div className="flex items-center sm:hidden">
-                        <button
-                            onClick={() => setMobileMenuOpen((v) => !v)}
-                        >
+                        <button onClick={() => setMobileMenuOpen((v) => !v)}>
                             {mobileMenuOpen ? <X /> : <Menu />}
                         </button>
                     </div>
                 </div>
             </div>
 
+            {/* MOBILE MENU */}
             {mobileMenuOpen && (
                 <div className="border-t bg-white sm:hidden">
                     {navLinks.map((link) => (
