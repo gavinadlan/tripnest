@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
@@ -26,9 +27,17 @@ import (
 const paymentConsumerGroup = "payment-service-group"
 
 func main() {
-	godotenv.Load()
+	if err := godotenv.Load(); err != nil {
+		log.Printf("No .env file loaded: %v", err)
+	}
 	cfg := config.Load()
 	log.Printf("Payment service DB target: %s", dbNameFromURL(cfg.DatabaseURL))
+	log.Printf("BOOKING_SERVICE_URL=%s", cfg.BookingURL)
+	log.Printf("MIDTRANS_SERVER_KEY loaded=%t", cfg.Midtrans.ServerKey != "")
+	log.Printf("MIDTRANS_CLIENT_KEY loaded=%t", cfg.Midtrans.ClientKey != "")
+	if cfg.Midtrans.ServerKey == "" || cfg.Midtrans.ClientKey == "" {
+		log.Fatal(errors.New("missing MIDTRANS_SERVER_KEY or MIDTRANS_CLIENT_KEY"))
+	}
 
 	db.RunMigrations(cfg.DatabaseURL)
 
@@ -103,11 +112,17 @@ func main() {
 					continue
 				}
 				for _, outboxEvent := range outboxEvents {
+					if strings.TrimSpace(outboxEvent.Key) == "" {
+						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, "empty message key")
+						log.Printf("Skipping outbox event with empty key topic=%s id=%s", outboxEvent.Topic, outboxEvent.ID)
+						continue
+					}
 					var payload map[string]interface{}
 					if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
 						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
 						continue
 					}
+					log.Printf("Publishing event to Kafka topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
 					if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
 						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
 						continue
