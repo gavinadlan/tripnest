@@ -71,3 +71,19 @@ func (r *CachedListingRepository) Search(ctx context.Context, params *model.Sear
 func (r *CachedListingRepository) Seed(ctx context.Context) error {
 	return r.next.Seed(ctx)
 }
+
+func (r *CachedListingRepository) List(ctx context.Context) ([]*model.Listing, error) {
+	return r.next.List(ctx)
+}
+
+func (r *CachedListingRepository) Create(ctx context.Context, listing *model.Listing) error {
+	return r.next.Create(ctx, listing)
+}
+
+func (r *CachedListingRepository) Update(ctx context.Context, id string, listing *model.Listing) error {
+	return r.next.Update(ctx, id, listing)
+}
+
+func (r *CachedListingRepository) Delete(ctx context.Context, id string) error {
+	return r.next.Delete(ctx, id)
+}

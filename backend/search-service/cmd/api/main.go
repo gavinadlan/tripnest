@@ -45,7 +45,7 @@ func main() {
 	// CORS Setup
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"}, // Frontend URL
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
@@ -64,6 +64,10 @@ func main() {
 	r.Post("/seed", h.Seed)
 
 	r.Get("/search", h.Search)
+	r.Get("/trips", h.ListTrips)
+	r.Post("/trips", h.CreateTrip)
+	r.Put("/trips/{id}", h.UpdateTrip)
+	r.Delete("/trips/{id}", h.DeleteTrip)
 
 	server := &http.Server{
 		Addr:    ":" + cfg.Port,
