@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/db"
+	"github.com/gavinadlan/tripnest/backend/payment-service/internal/handler"
+	"github.com/gavinadlan/tripnest/backend/payment-service/internal/midtrans"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/model"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/msgbroker"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/repository"
@@ -17,9 +23,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const paymentConsumerGroup = "payment-service-group"
+
 func main() {
 	godotenv.Load()
 	cfg := config.Load()
+	log.Printf("Payment service DB target: %s", dbNameFromURL(cfg.DatabaseURL))
 
 	db.RunMigrations(cfg.DatabaseURL)
 
@@ -32,10 +41,20 @@ func main() {
 	producer := msgbroker.NewProducer(cfg.KafkaBrokers)
 	defer producer.Close()
 
-	svc := service.NewPaymentService(repo, producer)
+	midtransClient := midtrans.NewClient(cfg.Midtrans.ServerKey, cfg.Midtrans.IsProduction)
+	svc := service.NewPaymentService(repo, producer, midtransClient, cfg.Midtrans.ServerKey, cfg.BookingURL)
+	h := handler.NewHandler(svc)
 
-	consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.created", "payment-service-group")
+	consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.created", paymentConsumerGroup)
 	defer consumer.Close()
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	server := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: corsMiddleware(mux),
+	}
 
 	log.Println("Payment Service Started (Listening for booking.created)")
 
@@ -50,6 +69,15 @@ func main() {
 				break
 			}
 
+			processed, err := repo.MarkMessageProcessed(ctx, paymentConsumerGroup, msg.Topic, string(msg.Key))
+			if err != nil {
+				log.Printf("Failed to mark booking.created message: %v", err)
+				continue
+			}
+			if !processed {
+				continue
+			}
+
 			var event model.BookingEvent
 			if err := json.Unmarshal(msg.Value, &event); err != nil {
 				log.Printf("Failed to unmarshal event: %v", err)
@@ -61,9 +89,79 @@ func main() {
 		}
 	}()
 
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				outboxEvents, err := repo.FetchPendingOutboxEvents(ctx, 50)
+				if err != nil {
+					log.Printf("Failed to fetch outbox events: %v", err)
+					continue
+				}
+				for _, outboxEvent := range outboxEvents {
+					var payload map[string]interface{}
+					if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
+						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
+						continue
+					}
+					if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
+						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
+						continue
+					}
+					if err := repo.MarkOutboxEventPublished(ctx, outboxEvent.ID); err != nil {
+						log.Printf("Failed to mark outbox event published: %v", err)
+						continue
+					}
+					log.Printf("Published outbox event topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
+				}
+			}
+		}
+	}()
+
+	go func() {
+		log.Printf("Payment service API running on port %s", cfg.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Failed to shutdown HTTP server: %v", err)
+	}
+
 	log.Println("Shutting down Payment Service")
+}
+
+func dbNameFromURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimPrefix(parsed.Path, "/")
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
