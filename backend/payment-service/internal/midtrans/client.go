@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -17,8 +19,16 @@ type Client struct {
 }
 
 type CreateSnapTransactionRequest struct {
-	OrderID     string
-	GrossAmount float64
+	OrderID         string
+	GrossAmount     int64
+	CustomerDetails CustomerDetails
+}
+
+type CustomerDetails struct {
+	FirstName string
+	LastName  string
+	Email     string
+	Phone     string
 }
 
 type CreateSnapTransactionResponse struct {
@@ -47,6 +57,12 @@ func (c *Client) CreateSnapTransaction(ctx context.Context, req CreateSnapTransa
 			"order_id":     req.OrderID,
 			"gross_amount": req.GrossAmount,
 		},
+		"customer_details": map[string]interface{}{
+			"first_name": req.CustomerDetails.FirstName,
+			"last_name":  req.CustomerDetails.LastName,
+			"email":      req.CustomerDetails.Email,
+			"phone":      req.CustomerDetails.Phone,
+		},
 	}
 
 	body, err := json.Marshal(payload)
@@ -70,13 +86,19 @@ func (c *Client) CreateSnapTransaction(ctx context.Context, req CreateSnapTransa
 	}
 	defer resp.Body.Close()
 
-	var out CreateSnapTransactionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("failed to decode midtrans response: %w", err)
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading midtrans response: %w", err)
 	}
+	log.Printf("MIDTRANS RAW RESPONSE: %s", string(responseBody))
 
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("midtrans error status=%d", resp.StatusCode)
+		return nil, fmt.Errorf("midtrans error status=%d body=%s", resp.StatusCode, string(responseBody))
+	}
+
+	var out CreateSnapTransactionResponse
+	if err := json.Unmarshal(responseBody, &out); err != nil {
+		return nil, fmt.Errorf("failed to decode midtrans response: %w body=%s", err, string(responseBody))
 	}
 
 	return &out, nil

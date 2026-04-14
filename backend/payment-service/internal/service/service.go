@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -49,24 +51,45 @@ func NewPaymentService(repo repository.PaymentRepository, _ *msgbroker.Producer,
 
 func (s *paymentService) ProcessPayment(ctx context.Context, event model.BookingEvent) error {
 	log.Printf("Processing payment for booking %s amount %.2f", event.BookingID, event.TotalAmount)
+	if strings.TrimSpace(event.BookingID) == "" {
+		return fmt.Errorf("invalid booking_id")
+	}
 
 	existing, err := s.repo.GetByBookingID(ctx, event.BookingID)
 	if err != nil {
 		return err
 	}
+	log.Printf(
+		"Existing payment check booking_id=%s exists=%t has_snap_token=%t",
+		event.BookingID,
+		existing != nil,
+		existing != nil && existing.SnapToken != "",
+	)
 	if existing != nil && existing.SnapToken != "" {
 		log.Printf("Payment already initialized for booking %s, skipping", event.BookingID)
 		return nil
 	}
 
-	orderID := event.BookingID
-	snapResp, err := s.midtransClient.CreateSnapTransaction(ctx, midtrans.CreateSnapTransactionRequest{
+	orderID := buildOrderID(event.BookingID)
+	requestPayload := midtrans.CreateSnapTransactionRequest{
 		OrderID:     orderID,
-		GrossAmount: event.TotalAmount,
-	})
+		GrossAmount: int64(math.Round(event.TotalAmount)),
+		CustomerDetails: midtrans.CustomerDetails{
+			FirstName: "TripNest",
+			LastName:  "Customer",
+			Email:     "user@tripnest.com",
+			Phone:     "08123456789",
+		},
+	}
+	log.Printf("MIDTRANS PAYLOAD: %+v", requestPayload)
+
+	snapResp, err := s.midtransClient.CreateSnapTransaction(ctx, requestPayload)
 	if err != nil {
-		log.Printf("Failed to create snap transaction: %v", err)
-		return err
+		log.Printf("MIDTRANS ERROR: %+v", err)
+		return fmt.Errorf("midtrans create transaction failed: %w", err)
+	}
+	if strings.TrimSpace(snapResp.Token) == "" {
+		return fmt.Errorf("midtrans returned empty snap token")
 	}
 
 	payment := &model.Payment{
@@ -80,8 +103,8 @@ func (s *paymentService) ProcessPayment(ctx context.Context, event model.Booking
 	}
 
 	if err := s.repo.UpsertInitiated(ctx, payment); err != nil {
-		log.Printf("Failed to create payment record: %v", err)
-		return err
+		log.Printf("DB ERROR failed to create payment record booking_id=%s: %+v", event.BookingID, err)
+		return fmt.Errorf("failed to save payment: %w", err)
 	}
 	log.Printf("Snap transaction created for booking %s order_id=%s", event.BookingID, orderID)
 
@@ -89,11 +112,22 @@ func (s *paymentService) ProcessPayment(ctx context.Context, event model.Booking
 }
 
 func (s *paymentService) GetPaymentByBookingID(ctx context.Context, bookingID string) (*model.Payment, error) {
+	if strings.TrimSpace(bookingID) == "" {
+		return nil, fmt.Errorf("booking_id is required")
+	}
+
 	payment, err := s.repo.GetByBookingID(ctx, bookingID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch payment by booking id: %w", err)
 	}
+	log.Printf(
+		"GetPaymentByBookingID existing payment booking_id=%s exists=%t has_snap_token=%t",
+		bookingID,
+		payment != nil,
+		payment != nil && payment.SnapToken != "",
+	)
 	if payment != nil && payment.SnapToken != "" {
+		log.Printf("Returning existing snap token for booking_id=%s", bookingID)
 		return payment, nil
 	}
 
@@ -115,7 +149,11 @@ func (s *paymentService) GetPaymentByBookingID(ctx context.Context, bookingID st
 		return nil, err
 	}
 
-	return s.repo.GetByBookingID(ctx, bookingID)
+	payment, err = s.repo.GetByBookingID(ctx, bookingID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch created payment by booking id: %w", err)
+	}
+	return payment, nil
 }
 
 func (s *paymentService) ListPayments(ctx context.Context, status string) ([]model.Payment, error) {
@@ -125,6 +163,13 @@ func (s *paymentService) ListPayments(ctx context.Context, status string) ([]mod
 func (s *paymentService) HandleWebhook(ctx context.Context, notification model.MidtransNotification) error {
 	if !s.isSignatureValid(notification) {
 		return fmt.Errorf("invalid midtrans signature")
+	}
+
+	// Ignore notifications that are clearly not from our TripNest flow.
+	// This avoids 500s from old/test notifications in Midtrans history.
+	if !strings.HasPrefix(notification.OrderID, "ORD-") {
+		log.Printf("Ignoring unsupported order_id format: %s", notification.OrderID)
+		return nil
 	}
 
 	idempotencyKey := notification.OrderID + ":" + notification.TransactionStatus
@@ -139,12 +184,27 @@ func (s *paymentService) HandleWebhook(ctx context.Context, notification model.M
 
 	status, topic := mapMidtransStatus(notification)
 	if topic == "" {
-		log.Printf("Webhook status does not emit event order_id=%s transaction_status=%s", notification.OrderID, notification.TransactionStatus)
+		log.Printf(
+			"Webhook status does not emit event order_id=%s transaction_status=%s",
+			notification.OrderID,
+			notification.TransactionStatus,
+		)
 		return nil
 	}
 
+	log.Printf(
+		"Applying webhook result order_id=%s transaction_status=%s mapped_status=%s",
+		notification.OrderID,
+		notification.TransactionStatus,
+		status,
+	)
+
 	payment, err := s.repo.ApplyWebhookResult(ctx, notification, status)
 	if err != nil {
+		if isIgnorableWebhookError(err) {
+			log.Printf("Ignoring webhook processing error for order_id=%s: %+v", notification.OrderID, err)
+			return nil
+		}
 		return err
 	}
 
@@ -157,8 +217,13 @@ func (s *paymentService) HandleWebhook(ctx context.Context, notification model.M
 	}
 
 	if err := s.repo.AddOutboxEvent(ctx, topic, payment.BookingID, event); err != nil {
+		if isIgnorableWebhookError(err) {
+			log.Printf("Ignoring outbox duplicate/conflict for booking_id=%s: %+v", payment.BookingID, err)
+			return nil
+		}
 		return err
 	}
+
 	log.Printf("Webhook processed and enqueued outbox event topic=%s booking_id=%s", topic, payment.BookingID)
 	return nil
 }
@@ -192,29 +257,62 @@ type bookingSnapshot struct {
 }
 
 func (s *paymentService) fetchBooking(ctx context.Context, bookingID string) (*bookingSnapshot, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.bookingServiceURL+"/bookings/"+bookingID, nil)
+	bookingURL := s.bookingServiceURL + "/bookings/" + bookingID
+	log.Printf("Fetching booking booking_id=%s url=%s", bookingID, bookingURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, bookingURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to build booking request: %w", err)
 	}
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("booking service unreachable at %s: %w", s.bookingServiceURL, err)
 	}
 	defer resp.Body.Close()
+
+	bodyBytes, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, fmt.Errorf("failed reading booking response: %w", readErr)
+	}
+	log.Printf("Booking fetch response booking_id=%s status=%d body=%s", bookingID, resp.StatusCode, string(bodyBytes))
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, fmt.Errorf("failed to fetch booking %s: status %d", bookingID, resp.StatusCode)
+		return nil, fmt.Errorf("failed to fetch booking %s: status %d body=%s", bookingID, resp.StatusCode, string(bodyBytes))
 	}
 
 	var booking bookingSnapshot
-	if err := json.NewDecoder(resp.Body).Decode(&booking); err != nil {
-		return nil, err
+	if err := json.Unmarshal(bodyBytes, &booking); err != nil {
+		return nil, fmt.Errorf("failed to decode booking payload: %w", err)
 	}
 	if booking.ID == "" {
 		return nil, nil
 	}
+
 	return &booking, nil
+}
+
+func buildOrderID(bookingID string) string {
+	shortID := bookingID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
+	return fmt.Sprintf("ORD-%s-%d", shortID, time.Now().Unix())
+}
+
+func isIgnorableWebhookError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "conflict") ||
+		strings.Contains(msg, "duplicate") ||
+		strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "already processed") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "404")
 }
