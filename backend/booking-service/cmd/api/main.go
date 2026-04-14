@@ -26,7 +26,10 @@ import (
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/service"
 )
 
-const bookingConsumerGroup = "booking-service-group"
+const (
+	paymentSuccessConsumerGroup = "booking-service-group-payment-success"
+	paymentFailedConsumerGroup  = "booking-service-group-payment-failed"
+)
 
 func main() {
 	godotenv.Load()
@@ -48,11 +51,11 @@ func main() {
 	svc := service.NewBookingService(repo, producer, cfg.BookingExpiryMinutes)
 
 	// Payment Success Consumer
-	paymentSuccessConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.success", bookingConsumerGroup)
+	paymentSuccessConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.success", paymentSuccessConsumerGroup)
 	defer paymentSuccessConsumer.Close()
 
 	// Payment Failed Consumer
-	paymentFailedConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.failed", bookingConsumerGroup)
+	paymentFailedConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.failed", paymentFailedConsumerGroup)
 	defer paymentFailedConsumer.Close()
 
 	h := handler.NewHandler(svc)
@@ -88,11 +91,15 @@ func main() {
 		for {
 			msg, err := paymentSuccessConsumer.ReadMessage(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				log.Printf("Payment Success Consumer error: %v", err)
-				break
+				continue
 			}
+			log.Printf("Received payment.success event key=%s", string(msg.Key))
 
-			processed, err := repo.MarkMessageProcessed(ctx, bookingConsumerGroup, msg.Topic, string(msg.Key))
+			processed, err := repo.MarkMessageProcessed(ctx, paymentSuccessConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
 				log.Printf("Failed to mark message processed: %v", err)
 				continue
@@ -106,6 +113,7 @@ func main() {
 				log.Printf("Failed to unmarshal payment success event: %v", err)
 				continue
 			}
+			log.Printf("Received payment.success event booking_id=%s status=%s", event.BookingID, event.Status)
 
 			if err := svc.ConfirmBooking(ctx, event.BookingID); err != nil {
 				log.Printf("Failed to confirm booking %s: %v", event.BookingID, err)
@@ -118,11 +126,15 @@ func main() {
 		for {
 			msg, err := paymentFailedConsumer.ReadMessage(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				log.Printf("Payment Failed Consumer error: %v", err)
-				break
+				continue
 			}
+			log.Printf("Received payment.failed event key=%s", string(msg.Key))
 
-			processed, err := repo.MarkMessageProcessed(ctx, bookingConsumerGroup, msg.Topic, string(msg.Key))
+			processed, err := repo.MarkMessageProcessed(ctx, paymentFailedConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
 				log.Printf("Failed to mark message processed: %v", err)
 				continue
@@ -136,6 +148,7 @@ func main() {
 				log.Printf("Failed to unmarshal payment failed event: %v", err)
 				continue
 			}
+			log.Printf("Received payment.failed event booking_id=%s status=%s", event.BookingID, event.Status)
 
 			if err := svc.CancelBooking(ctx, event.BookingID); err != nil {
 				log.Printf("Failed to cancel booking %s: %v", event.BookingID, err)
@@ -177,9 +190,13 @@ func main() {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(time.Duration(cfg.BookingExpiryInterval) * time.Second)
+		expiryCheckInterval := time.Duration(cfg.BookingExpiryInterval) * time.Second
+		if expiryCheckInterval < time.Minute {
+			expiryCheckInterval = time.Minute
+		}
+		ticker := time.NewTicker(expiryCheckInterval)
 		defer ticker.Stop()
-		log.Printf("Starting booking expiration worker (interval=%ds)", cfg.BookingExpiryInterval)
+		log.Printf("Starting booking expiration worker (interval=%s)", expiryCheckInterval)
 		for {
 			select {
 			case <-ctx.Done():
