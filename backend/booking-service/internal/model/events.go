@@ -5,6 +5,7 @@ type BookingCreatedEvent struct {
 	UserID      string  `json:"user_id"`
 	ResourceID  string  `json:"resource_id"`
 	TotalAmount float64 `json:"total_amount"`
+	ExpiresAt   string  `json:"expires_at"`
 }
 
 type PaymentProcessedEvent struct {
@@ -13,4 +14,9 @@ type PaymentProcessedEvent struct {
 	Amount        float64 `json:"amount"`
 	Status        string  `json:"status"` // SUCCESS, FAILED
 	TransactionID string  `json:"transaction_id"`
+}
+
+type BookingExpiredEvent struct {
+	BookingID string `json:"booking_id"`
+	Status    string `json:"status"`
 }
