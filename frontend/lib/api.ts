@@ -3,6 +3,7 @@ import axios from 'axios';
 export const USER_SERVICE_URL = process.env.NEXT_PUBLIC_USER_SERVICE_URL || 'http://localhost:8080';
 export const BOOKING_SERVICE_URL = process.env.NEXT_PUBLIC_BOOKING_SERVICE_URL || 'http://localhost:8081';
 export const SEARCH_SERVICE_URL = process.env.NEXT_PUBLIC_SEARCH_SERVICE_URL || 'http://localhost:8083';
+export const PAYMENT_SERVICE_URL = process.env.NEXT_PUBLIC_PAYMENT_SERVICE_URL || 'http://localhost:8082';
 
 export const userApi = axios.create({
   baseURL: USER_SERVICE_URL,
@@ -14,6 +15,10 @@ export const bookingApi = axios.create({
 
 export const searchApi = axios.create({
   baseURL: SEARCH_SERVICE_URL,
+});
+
+export const paymentApi = axios.create({
+  baseURL: PAYMENT_SERVICE_URL,
 });
 
 // Adding an interceptor to inject JWT into bookingApi
