@@ -4,6 +4,7 @@ use (
 	./api-gateway
 	./booking-service
 	./common
+	./inventory-service
 	./notification-service
 	./payment-service
 	./recommendation-service
