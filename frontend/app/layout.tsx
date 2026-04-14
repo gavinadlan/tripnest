@@ -1,7 +1,6 @@
 import type { Metadata } from 'next';
 import './globals.css';
-import Navbar from '@/components/Navbar';
-import Footer from '@/components/Footer';
+import AppChrome from '@/components/AppChrome';
 import { Toaster } from 'react-hot-toast';
 
 export const metadata: Metadata = {
@@ -15,19 +14,16 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="h-full bg-gray-50">
-      <body className="h-full antialiased text-gray-900 flex flex-col min-h-screen">
-        <Navbar />
-        <main className="flex-1 w-full max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-          {children}
-        </main>
-        <Footer />
+    <html lang="en" className="h-full">
+      <body className="flex min-h-screen flex-col antialiased">
+        <AppChrome>{children}</AppChrome>
         <Toaster
           position="bottom-right"
           toastOptions={{
             style: {
-              background: '#333',
-              color: '#fff',
+              background: '#ffffff',
+              color: '#0F172A',
+              border: '1px solid #E2E8F0',
               borderRadius: '8px',
               fontWeight: 500,
             }

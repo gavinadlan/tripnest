@@ -2,13 +2,11 @@
 
 import { useState } from 'react';
 import { userApi } from '@/lib/api';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import toast from 'react-hot-toast';
 import { PlaneTakeoff, Mail, Lock, LogIn } from 'lucide-react';
 
 export default function LoginPage() {
-    const router = useRouter();
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [loading, setLoading] = useState(false);
@@ -23,14 +21,14 @@ export default function LoginPage() {
             const response = await userApi.post('/login', { email, password });
 
             localStorage.setItem('token', response.data.token);
-            localStorage.setItem('user_id', response.data.user_id);
+            localStorage.setItem('user_id', response.data.user.id);
 
             toast.success('Welcome back!', { id: loadingToast });
 
             // Force reload to update navbar state
-            window.location.href = '/search';
-        } catch (err: any) {
-            toast.error(err.response?.data?.error || 'Failed to login', { id: loadingToast });
+            window.location.href = '/';
+        } catch {
+            toast.error('Failed to login', { id: loadingToast });
             setLoading(false);
         }
     };
@@ -129,7 +127,7 @@ export default function LoginPage() {
                 </form>
 
                 <div className="mt-6 text-center text-sm">
-                    <span className="text-gray-500">Don't have an account? </span>
+                    <span className="text-gray-500">Don&apos;t have an account? </span>
                     <Link href="/register" className="font-bold text-indigo-600 hover:text-indigo-500 hover:underline transition-all">
                         Sign up for free
                     </Link>

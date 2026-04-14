@@ -27,8 +27,8 @@ export default function RegisterPage() {
             await userApi.post('/register', formData);
             toast.success('Account created successfully!', { id: loadingToast });
             router.push('/login');
-        } catch (err: any) {
-            toast.error(err.response?.data?.error || 'Failed to register', { id: loadingToast });
+        } catch {
+            toast.error('Failed to register', { id: loadingToast });
             setLoading(false);
         }
     };
