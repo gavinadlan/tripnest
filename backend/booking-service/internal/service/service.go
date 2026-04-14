@@ -26,6 +26,9 @@ type bookingService struct {
 }
 
 func NewBookingService(repo repository.BookingRepository, _ *events.KafkaProducer, bookingExpiryMinutes int) BookingService {
+	if bookingExpiryMinutes < 10 {
+		bookingExpiryMinutes = 10
+	}
 	return &bookingService{
 		repo:         repo,
 		expiryWindow: time.Duration(bookingExpiryMinutes) * time.Minute,

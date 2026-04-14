@@ -19,12 +19,12 @@ type Config struct {
 func Load() *Config {
 	brokers := env.GetString("KAFKA_BROKERS", "localhost:9092")
 	expiryMinutes, err := strconv.Atoi(env.GetString("BOOKING_EXPIRY_MINUTES", "15"))
-	if err != nil || expiryMinutes <= 0 {
+	if err != nil || expiryMinutes < 10 {
 		expiryMinutes = 15
 	}
-	expiryInterval, err := strconv.Atoi(env.GetString("BOOKING_EXPIRY_INTERVAL_SECONDS", "30"))
-	if err != nil || expiryInterval <= 0 {
-		expiryInterval = 30
+	expiryInterval, err := strconv.Atoi(env.GetString("BOOKING_EXPIRY_INTERVAL_SECONDS", "60"))
+	if err != nil || expiryInterval < 60 {
+		expiryInterval = 60
 	}
 	return &Config{
 		Port:                  env.GetString("PORT", "8081"),
