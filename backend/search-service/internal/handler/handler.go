@@ -5,10 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/gavinadlan/tripnest/backend/common/utils"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/model"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/service"
 	"github.com/go-chi/chi/v5"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 type Handler struct {
@@ -79,6 +82,28 @@ func (h *Handler) ListTrips(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": trips})
 }
 
+// GetTrip mengembalikan satu trip. booking-service memakai endpoint ini
+// untuk mengambil harga resmi, jadi bentuk responsnya harus stabil.
+func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		utils.WriteError(w, http.StatusBadRequest, errors.New("id wajib diisi"))
+		return
+	}
+
+	trip, err := h.svc.GetTrip(r.Context(), id)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if trip == nil {
+		utils.WriteError(w, http.StatusNotFound, errors.New("trip tidak ditemukan"))
+		return
+	}
+
+	_ = utils.WriteJSON(w, http.StatusOK, trip)
+}
+
 func (h *Handler) CreateTrip(w http.ResponseWriter, r *http.Request) {
 	var req model.Listing
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -114,7 +139,11 @@ func (h *Handler) UpdateTrip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.UpdateTrip(r.Context(), id, &req); err != nil {
-		http.Error(w, `{"error":"failed to update trip"}`, http.StatusInternalServerError)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			utils.WriteError(w, http.StatusNotFound, errors.New("trip tidak ditemukan"))
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -128,7 +157,11 @@ func (h *Handler) DeleteTrip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.DeleteTrip(r.Context(), id); err != nil {
-		http.Error(w, `{"error":"failed to delete trip"}`, http.StatusInternalServerError)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			utils.WriteError(w, http.StatusNotFound, errors.New("trip tidak ditemukan"))
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -136,13 +169,24 @@ func (h *Handler) DeleteTrip(w http.ResponseWriter, r *http.Request) {
 
 func validateListing(listing *model.Listing) error {
 	if listing.Title == "" || listing.Destination == "" || listing.Date == "" {
-		return errors.New("title, destination, and date are required")
+		return errors.New("title, destination, dan date wajib diisi")
 	}
 	if listing.Price <= 0 {
-		return errors.New("price must be greater than 0")
+		return errors.New("price harus lebih dari 0")
 	}
 	if listing.AvailableSlots < 0 {
-		return errors.New("available_slots must be non-negative")
+		return errors.New("available_slots tidak boleh negatif")
+	}
+
+	// Tanggal disimpan sebagai string YYYY-MM-DD, jadi formatnya harus
+	// divalidasi di sini -- kalau tidak, filter pencarian per tanggal
+	// diam-diam tidak pernah cocok.
+	parsed, err := time.Parse("2006-01-02", listing.Date)
+	if err != nil {
+		return errors.New("date harus berformat YYYY-MM-DD")
+	}
+	if parsed.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
+		return errors.New("date tidak boleh di masa lalu")
 	}
 	return nil
 }

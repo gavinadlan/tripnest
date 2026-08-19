@@ -11,6 +11,7 @@ export interface Booking {
   id: string;
   user_id: string;
   resource_id: string;
+  quantity: number;
   total_amount: number;
   status: string;
   expires_at?: string;

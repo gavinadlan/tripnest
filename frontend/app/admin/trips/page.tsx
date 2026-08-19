@@ -28,7 +28,7 @@ export default function AdminTripsPage() {
   const [trips, setTrips] = useState<Trip[]>([]);
   const [form, setForm] = useState<TripForm>(initialForm);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   const loadTrips = async () => {
     setLoading(true);
@@ -43,7 +43,25 @@ export default function AdminTripsPage() {
   };
 
   useEffect(() => {
-    void loadTrips();
+    // Pengambilan awal ditulis langsung di dalam effect. Memanggil
+    // loadTrips() di sini akan menjalankan setState secara sinkron pada
+    // saat effect berjalan, yang memicu render berantai.
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const res = await adminTripApi.get('/trips');
+        if (!cancelled) setTrips(res.data.data || []);
+      } catch {
+        if (!cancelled) toast.error('Gagal memuat data trip');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const resetForm = () => {

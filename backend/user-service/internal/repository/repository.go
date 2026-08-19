@@ -7,13 +7,25 @@ import (
 
 	"github.com/gavinadlan/tripnest/backend/user-service/internal/model"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// uniqueViolation adalah SQLSTATE Postgres untuk pelanggaran unique index.
+const uniqueViolation = "23505"
+
+// IsUniqueViolation melaporkan apakah err berasal dari unique index.
+// Memeriksa kode SQLSTATE jauh lebih andal daripada mencocokkan teks error.
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == uniqueViolation
+}
 
 type UserRepository interface {
 	Create(ctx context.Context, user *model.User) error
 	GetByEmail(ctx context.Context, email string) (*model.User, error)
 	GetByID(ctx context.Context, id string) (*model.User, error)
+	UpsertAdmin(ctx context.Context, email, hashedPassword string) (string, error)
 	Close()
 }
 
@@ -91,4 +103,24 @@ func (r *postgresRepository) GetByID(ctx context.Context, id string) (*model.Use
 		return nil, fmt.Errorf("failed to get user by id: %w", err)
 	}
 	return &user, nil
+}
+
+// UpsertAdmin membuat atau memperbarui satu akun admin. Dipakai saat startup
+// untuk mem-bootstrap admin pertama dari environment, menggantikan kredensial
+// hardcoded di frontend.
+func (r *postgresRepository) UpsertAdmin(ctx context.Context, email, hashedPassword string) (string, error) {
+	query := `
+        INSERT INTO users (email, password, first_name, last_name, role)
+        VALUES ($1, $2, 'Admin', 'TripNest', 'admin')
+        ON CONFLICT (email) DO UPDATE SET
+            password = EXCLUDED.password,
+            role = 'admin',
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id`
+
+	var id string
+	if err := r.db.QueryRow(ctx, query, email, hashedPassword).Scan(&id); err != nil {
+		return "", fmt.Errorf("failed to upsert admin: %w", err)
+	}
+	return id, nil
 }

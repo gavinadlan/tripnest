@@ -1,12 +1,15 @@
 'use client';
 
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { userApi } from '@/lib/api';
+import { setToken } from '@/lib/auth';
 import Link from 'next/link';
 import toast from 'react-hot-toast';
 import { PlaneTakeoff, Mail, Lock, LogIn } from 'lucide-react';
 
-export default function LoginPage() {
+function LoginForm() {
+    const searchParams = useSearchParams();
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [loading, setLoading] = useState(false);
@@ -20,15 +23,21 @@ export default function LoginPage() {
         try {
             const response = await userApi.post('/login', { email, password });
 
-            localStorage.setItem('token', response.data.token);
-            localStorage.setItem('user_id', response.data.user.id);
+            setToken(response.data.token);
 
             toast.success('Welcome back!', { id: loadingToast });
 
-            // Force reload to update navbar state
-            window.location.href = '/';
-        } catch {
-            toast.error('Failed to login', { id: loadingToast });
+            // Reload penuh supaya Navbar dan middleware membaca cookie baru.
+            const next = searchParams.get('next');
+            window.location.href = next && next.startsWith('/') ? next : '/';
+        } catch (error: unknown) {
+            const status =
+                typeof error === 'object' && error !== null && 'response' in error
+                    ? (error as { response?: { status?: number } }).response?.status
+                    : undefined;
+            toast.error(status === 401 ? 'Email atau password salah' : 'Gagal masuk, coba lagi', {
+                id: loadingToast,
+            });
             setLoading(false);
         }
     };
@@ -134,5 +143,13 @@ export default function LoginPage() {
                 </div>
             </div>
         </div>
+    );
+}
+
+export default function LoginPage() {
+    return (
+        <Suspense fallback={<p className="p-8 text-center text-gray-500">Memuat...</p>}>
+            <LoginForm />
+        </Suspense>
     );
 }

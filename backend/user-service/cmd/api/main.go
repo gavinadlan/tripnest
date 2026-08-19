@@ -15,6 +15,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/gavinadlan/tripnest/backend/common/auth"
+	"github.com/gavinadlan/tripnest/backend/common/ratelimit"
 	"github.com/gavinadlan/tripnest/backend/user-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/user-service/internal/db"
 	"github.com/gavinadlan/tripnest/backend/user-service/internal/handler"
@@ -23,8 +25,15 @@ import (
 )
 
 func main() {
-	godotenv.Load()
+	_ = godotenv.Load()
 	cfg := config.Load()
+
+	// Gagal cepat kalau secret lemah: service yang jalan dengan secret
+	// bisa-ditebak lebih berbahaya daripada service yang tidak jalan.
+	verifier, err := auth.NewVerifier(cfg.JWTSecret)
+	if err != nil {
+		log.Fatalf("Konfigurasi auth tidak valid: %v", err)
+	}
 
 	db.RunMigrations(cfg.DatabaseURL)
 
@@ -34,33 +43,53 @@ func main() {
 	}
 	defer repo.Close()
 
-	svc := service.NewUserService(repo, cfg)
+	svc := service.NewUserService(repo, cfg, verifier)
 	h := handler.NewHandler(svc)
 
+	if cfg.AdminEmail != "" && cfg.AdminPassword != "" {
+		bootstrapCtx, cancelBootstrap := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := svc.EnsureAdmin(bootstrapCtx, cfg.AdminEmail, cfg.AdminPassword); err != nil {
+			log.Fatalf("Gagal menyiapkan akun admin: %v", err)
+		}
+		log.Printf("Akun admin siap: %s", cfg.AdminEmail)
+		cancelBootstrap()
+	} else {
+		log.Println("ADMIN_EMAIL/ADMIN_PASSWORD tidak diisi, bootstrap admin dilewati")
+	}
+
+	// Brute force di /login dan /register dibatasi per alamat IP.
+	authLimiter := ratelimit.New(10, time.Minute)
+	defer authLimiter.Close()
+
 	r := chi.NewRouter()
-	// CORS Setup
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:3000"}, // Frontend URL
+		AllowedOrigins:   cfg.CORSOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
-
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Route Grouping
+	r.Get("/health", h.Health)
+
 	r.Group(func(r chi.Router) {
+		r.Use(authLimiter.Middleware)
 		r.Post("/register", h.Register)
 		r.Post("/login", h.Login)
-		r.Get("/health", h.Health)
+	})
+
+	r.Group(func(r chi.Router) {
+		r.Use(verifier.Required)
+		r.Get("/me", h.Me)
 	})
 
 	server := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {

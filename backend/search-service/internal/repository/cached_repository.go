@@ -69,7 +69,41 @@ func (r *CachedListingRepository) Search(ctx context.Context, params *model.Sear
 }
 
 func (r *CachedListingRepository) Seed(ctx context.Context) error {
-	return r.next.Seed(ctx)
+	if err := r.next.Seed(ctx); err != nil {
+		return err
+	}
+	r.invalidate(ctx)
+	return nil
+}
+
+func (r *CachedListingRepository) GetByID(ctx context.Context, id string) (*model.Listing, error) {
+	return r.next.GetByID(ctx, id)
+}
+
+// invalidate menghapus seluruh hasil search yang di-cache.
+//
+// Tanpa ini, perubahan trip baru terlihat setelah TTL habis dan admin
+// mengira simpanannya gagal. Pola search:* jumlahnya kecil di skala ini,
+// jadi SCAN sekali jalan sudah memadai.
+func (r *CachedListingRepository) invalidate(ctx context.Context) {
+	var cursor uint64
+	for {
+		keys, next, err := r.rdb.Scan(ctx, cursor, "search:*", 200).Result()
+		if err != nil {
+			log.Printf("Gagal memindai cache untuk invalidasi: %v", err)
+			return
+		}
+		if len(keys) > 0 {
+			if err := r.rdb.Del(ctx, keys...).Err(); err != nil {
+				log.Printf("Gagal menghapus cache: %v", err)
+				return
+			}
+		}
+		if next == 0 {
+			return
+		}
+		cursor = next
+	}
 }
 
 func (r *CachedListingRepository) List(ctx context.Context) ([]*model.Listing, error) {
@@ -77,13 +111,25 @@ func (r *CachedListingRepository) List(ctx context.Context) ([]*model.Listing, e
 }
 
 func (r *CachedListingRepository) Create(ctx context.Context, listing *model.Listing) error {
-	return r.next.Create(ctx, listing)
+	if err := r.next.Create(ctx, listing); err != nil {
+		return err
+	}
+	r.invalidate(ctx)
+	return nil
 }
 
 func (r *CachedListingRepository) Update(ctx context.Context, id string, listing *model.Listing) error {
-	return r.next.Update(ctx, id, listing)
+	if err := r.next.Update(ctx, id, listing); err != nil {
+		return err
+	}
+	r.invalidate(ctx)
+	return nil
 }
 
 func (r *CachedListingRepository) Delete(ctx context.Context, id string) error {
-	return r.next.Delete(ctx, id)
+	if err := r.next.Delete(ctx, id); err != nil {
+		return err
+	}
+	r.invalidate(ctx)
+	return nil
 }

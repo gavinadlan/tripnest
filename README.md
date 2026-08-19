@@ -147,6 +147,26 @@ Search uses MongoDB and Redis; transactional data stays in PostgreSQL for user, 
 * Docker & Docker Compose
 * Go 1.24+ (for local development)
 
+### Environment
+
+Salin `.env.example` menjadi `.env` di root, lalu isi minimal dua nilai:
+
+```bash
+cp .env.example .env
+
+# JWT_SECRET wajib >= 32 karakter. Semua service memakai nilai yang sama.
+openssl rand -base64 48
+```
+
+| Variabel | Wajib | Keterangan |
+| :--- | :--- | :--- |
+| `JWT_SECRET` | ya | Minimal 32 karakter. Semua service **menolak start** bila kosong atau terlalu pendek. |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | ya | Akun admin pertama, dibuat otomatis oleh user-service saat start. |
+| `MIDTRANS_SERVER_KEY` / `MIDTRANS_CLIENT_KEY` | ya | Dari dashboard Midtrans sandbox. |
+| `CORS_ORIGINS` | tidak | Default `http://localhost:3000`. |
+
+Frontend membaca `NEXT_PUBLIC_MIDTRANS_CLIENT_KEY` dari `frontend/.env.local`.
+
 ### Running the System
 
 1. **Build and Start Services**
@@ -185,49 +205,109 @@ Search uses MongoDB and Redis; transactional data stays in PostgreSQL for user, 
 3. **Access the UI**
    Open `http://localhost:3000` in your browser.
 
+## Autentikasi
+
+Semua endpoint selain katalog publik, health, dan webhook Midtrans
+memerlukan header `Authorization: Bearer <token>`.
+
+| Peran | Cara mendapat token | Hak |
+| :--- | :--- | :--- |
+| User | `POST /login` di user-service | Membuat booking, melihat & membatalkan booking miliknya sendiri |
+| Admin | `POST /login` dengan akun ber-`role=admin` | Semua di atas, plus CRUD trip, kelola inventaris, lihat semua booking & pembayaran |
+| Service | Diterbitkan internal, berumur 5 menit | Endpoint `/internal/*` antar service |
+
+Harga booking dan identitas pemesan **tidak pernah** diambil dari request.
+Harga dibaca server dari katalog, `user_id` dibaca dari klaim token.
+
 ## API Testing (example flow)
 
-### 1. Register User
+### 1. Register
 ```bash
 curl -X POST http://localhost:8080/register \
   -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com", "password":"password123", "first_name":"John", "last_name":"Doe"}'
+  -d '{"email":"user@example.com","password":"password123","first_name":"John","last_name":"Doe"}'
 ```
 
-### 2. Login (Get Token)
+Password minimal 8 karakter. Email duplikat dibalas `409`.
+
+### 2. Login
 ```bash
-curl -X POST http://localhost:8080/login \
+TOKEN=$(curl -s -X POST http://localhost:8080/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com", "password":"password123"}'
+  -d '{"email":"user@example.com","password":"password123"}' | jq -r .token)
 ```
 
-### 3. Create Booking
+### 3. Lihat katalog (publik)
+```bash
+curl "http://localhost:8083/search?destination=Bali&min_price=100000"
+curl http://localhost:8083/trips/<TRIP_ID>
+```
+
+### 4. Buat booking
 ```bash
 curl -X POST http://localhost:8081/bookings \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"user_id":"<USER_ID_FROM_STEP_1>", "resource_id":"flight-101", "total_amount": 250.00}'
+  -d '{"resource_id":"<TRIP_ID>","quantity":2}'
 ```
 
-Response includes **`id`** and **`"status": "PENDING_PAYMENT"`**. A **`booking.created`** outbox event will be published to Kafka shortly.
+Body hanya berisi `resource_id` dan `quantity`. Mengirim `total_amount`
+atau `user_id` akan ditolak `400` -- keduanya ditentukan server.
 
-### 4. Check Booking Status
+### 5. Booking saya
 ```bash
-curl http://localhost:8081/bookings/<BOOKING_ID_FROM_STEP_3>
+curl http://localhost:8081/bookings -H "Authorization: Bearer $TOKEN"
 ```
 
-Status stays **`PENDING_PAYMENT`** until a **successful Midtrans payment** and webhook processing produce **`payment.success`** and the booking-service consumer runs **`ConfirmBooking`**. Without completing payment, expect **`PENDING_PAYMENT`** (or **`EXPIRED`** after `expires_at`).
+Otomatis dibatasi pada booking milik pemanggil. Admin melihat semuanya.
 
-### 5. Snap token (payment-service)
+### 6. Mulai pembayaran
 ```bash
-curl "http://localhost:8082/payments/snap-token?booking_id=<BOOKING_ID_FROM_STEP_3>"
+# Membuat transaksi Snap bila belum ada (idempoten)
+curl -X POST http://localhost:8082/payments/snap-token \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"booking_id":"<BOOKING_ID>"}'
+
+# Membaca token yang sudah ada, tanpa efek samping
+curl "http://localhost:8082/payments/snap-token?booking_id=<BOOKING_ID>" \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-### 6. Search Listings (Search Service)
-Seed the database:
+Masa berlaku transaksi Snap disamakan dengan `expires_at` booking, dan
+booking yang tidak berstatus `PENDING_PAYMENT` ditolak `409`.
+
+### 7. Endpoint admin
 ```bash
-curl -X POST http://localhost:8083/seed
+ADMIN=$(curl -s -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@tripnest.local","password":"<ADMIN_PASSWORD>"}' | jq -r .token)
+
+curl -X POST http://localhost:8083/trips \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"title":"Bali Retreat","destination":"Bali","price":2500000,"date":"2026-12-01","available_slots":12}'
+
+curl http://localhost:8082/payments -H "Authorization: Bearer $ADMIN"
 ```
-Then search:
-```bash
-curl "http://localhost:8083/search?destination=Paris&min_price=100&max_price=500"
-```
+
+`GET /payments` tidak pernah mengembalikan `snap_token` atau
+`raw_notification`.
+
+## Known Limitations
+
+Jujur soal apa yang belum selesai, supaya klaim di atas tidak melebihi kode:
+
+- **Outbox baru sebagian transaksional.** `booking.created` sudah ditulis
+  dalam transaksi yang sama dengan booking-nya. Jalur webhook di
+  payment-service masih menulis outbox di luar transaksi update payment.
+- **Idempotensi consumer masih at-most-once.** `processed_messages` ditandai
+  sebelum handler berjalan, jadi kegagalan handler membuat event terlewat.
+- **Outbox worker belum aman untuk banyak instance** (belum ada
+  `FOR UPDATE SKIP LOCKED`), dan retry-nya belum berbatas.
+- **Trip dan inventaris masih dua sumber kebenaran.** Trip di MongoDB,
+  kapasitas di Postgres, belum ada yang menyinkronkan. Karena itu
+  `available_slots` yang tampil di katalog belum berkurang saat ada booking.
+- **Belum ada test dan CI.**
+- **Token disimpan di cookie yang terbaca JavaScript**, belum httpOnly.
+
+Rencana penyelesaiannya ada di `PLAN-TRIPNEST.md`.

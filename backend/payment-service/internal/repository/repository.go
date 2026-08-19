@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -199,6 +200,11 @@ func (r *postgresRepository) MarkWebhookProcessed(ctx context.Context, key strin
 	return tag.RowsAffected() == 1, nil
 }
 
+// ErrPaymentNotFound dikembalikan bila webhook merujuk order_id yang tidak
+// ada di tabel payments. Pemanggil memeriksanya dengan errors.Is, bukan
+// dengan mencocokkan teks error.
+var ErrPaymentNotFound = errors.New("payment tidak ditemukan")
+
 func (r *postgresRepository) ApplyWebhookResult(ctx context.Context, notification model.MidtransNotification, status string) (*model.Payment, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -267,6 +273,9 @@ func (r *postgresRepository) ApplyWebhookResult(ctx context.Context, notificatio
 		&p.CreatedAt,
 		&p.UpdatedAt,
 	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrPaymentNotFound
+		}
 		return nil, fmt.Errorf("failed to update payment from webhook: %w", err)
 	}
 

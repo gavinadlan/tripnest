@@ -5,24 +5,31 @@ import (
 	"math"
 	"net/http"
 
+	"github.com/gavinadlan/tripnest/backend/common/auth"
 	"github.com/gavinadlan/tripnest/backend/common/utils"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/model"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/service"
 )
 
 type Handler struct {
-	svc service.InventoryService
+	svc      service.InventoryService
+	verifier *auth.Verifier
 }
 
-func NewHandler(svc service.InventoryService) *Handler {
-	return &Handler{svc: svc}
+func NewHandler(svc service.InventoryService, verifier *auth.Verifier) *Handler {
+	return &Handler{svc: svc, verifier: verifier}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /inventory", h.UpsertInventory)
-	mux.HandleFunc("GET /inventory", h.GetInventory)
-	mux.HandleFunc("PATCH /inventory/{resource_id}", h.UpdateInventory)
 	mux.HandleFunc("GET /health", h.Health)
+
+	// Ketersediaan kursi boleh dibaca siapa saja: itu informasi etalase.
+	mux.HandleFunc("GET /inventory", h.GetInventory)
+
+	// Mengubah kapasitas hanya untuk admin. Sebelumnya endpoint ini
+	// terbuka, jadi siapa pun bisa menaikkan atau menghabiskan stok.
+	mux.Handle("POST /inventory", h.verifier.AdminOnly(h.UpsertInventory))
+	mux.Handle("PATCH /inventory/{resource_id}", h.verifier.AdminOnly(h.UpdateInventory))
 }
 
 func (h *Handler) UpsertInventory(w http.ResponseWriter, r *http.Request) {

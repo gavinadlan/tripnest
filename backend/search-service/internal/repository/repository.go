@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"regexp"
 	"time"
 
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/model"
@@ -16,6 +17,7 @@ import (
 type ListingRepository interface {
 	Search(ctx context.Context, params *model.SearchParams) ([]*model.Listing, int64, error)
 	List(ctx context.Context) ([]*model.Listing, error)
+	GetByID(ctx context.Context, id string) (*model.Listing, error)
 	Create(ctx context.Context, listing *model.Listing) error
 	Update(ctx context.Context, id string, listing *model.Listing) error
 	Delete(ctx context.Context, id string) error
@@ -54,7 +56,9 @@ func (r *mongoRepository) Search(ctx context.Context, params *model.SearchParams
 	filter := bson.M{}
 
 	if params.Destination != "" {
-		filter["destination"] = bson.M{"$regex": params.Destination, "$options": "i"} // Case-insensitive search
+		// QuoteMeta wajib: tanpa ini input seperti "(a+)+$" jadi regex
+		// katastrofik yang menggantung MongoDB (ReDoS).
+		filter["destination"] = bson.M{"$regex": regexp.QuoteMeta(params.Destination), "$options": "i"}
 	}
 	if params.MinPrice > 0 || params.MaxPrice > 0 {
 		priceFilter := bson.M{}
@@ -106,6 +110,26 @@ func (r *mongoRepository) List(ctx context.Context) ([]*model.Listing, error) {
 		return nil, err
 	}
 	return listings, nil
+}
+
+// GetByID dipakai booking-service untuk mengambil harga resmi sebuah trip.
+// Harga tidak boleh lagi datang dari request client.
+func (r *mongoRepository) GetByID(ctx context.Context, id string) (*model.Listing, error) {
+	oid, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		// Id yang tidak berbentuk ObjectID berarti trip tidak ada,
+		// bukan kesalahan server.
+		return nil, nil
+	}
+
+	var listing model.Listing
+	if err := r.coll.FindOne(ctx, bson.M{"_id": oid}).Decode(&listing); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &listing, nil
 }
 
 func (r *mongoRepository) Create(ctx context.Context, listing *model.Listing) error {

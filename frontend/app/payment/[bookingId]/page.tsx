@@ -1,177 +1,188 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import toast from 'react-hot-toast';
+import { bookingApi, paymentApi } from '@/lib/api';
+import { Booking } from '@/lib/types';
+import { formatRupiah } from '@/lib/currency';
 
-const API_BOOKING = 'http://localhost:8081';
+const SNAP_SCRIPT_URL =
+  process.env.NEXT_PUBLIC_MIDTRANS_SNAP_URL || 'https://app.sandbox.midtrans.com/snap/snap.js';
+const SNAP_CLIENT_KEY = process.env.NEXT_PUBLIC_MIDTRANS_CLIENT_KEY || '';
+
+// Dihitung sekali di level modul, bukan lewat setState di dalam effect.
+const CONFIG_ERROR = SNAP_CLIENT_KEY ? '' : 'NEXT_PUBLIC_MIDTRANS_CLIENT_KEY belum diatur';
+
+type SnapResult = { transaction_status?: string };
+type SnapApi = {
+  pay: (
+    token: string,
+    callbacks: {
+      onSuccess?: (result: SnapResult) => void;
+      onPending?: (result: SnapResult) => void;
+      onError?: (result: SnapResult) => void;
+      onClose?: () => void;
+    }
+  ) => void;
+};
 
 export default function PaymentPage() {
-  const params = useParams();
+  const params = useParams<{ bookingId: string }>();
   const router = useRouter();
+  const bookingId = typeof params?.bookingId === 'string' ? params.bookingId : '';
 
-  const bookingId =
-    typeof params?.bookingId === 'string' ? params.bookingId : '';
-
-  const [booking, setBooking] = useState<any>(null);
+  const [booking, setBooking] = useState<Booking | null>(null);
   const [snapToken, setSnapToken] = useState('');
   const [loading, setLoading] = useState(true);
+  const [paying, setPaying] = useState(false);
   const [error, setError] = useState('');
 
-  // 🔥 LOAD MIDTRANS SCRIPT
+  // Muat skrip Snap sekali, dan tandai kapan benar-benar siap dipakai.
   useEffect(() => {
+    if (CONFIG_ERROR) return;
+
+    // Kesiapan Snap dicek saat tombol ditekan lewat window.snap, bukan
+    // disimpan di state. Skrip ini hidup di luar React dan bisa sudah
+    // termuat dari kunjungan sebelumnya.
     if (document.getElementById('midtrans-script')) return;
 
     const script = document.createElement('script');
     script.id = 'midtrans-script';
-    script.src = 'https://app.sandbox.midtrans.com/snap/snap.js';
-    script.setAttribute(
-      'data-client-key',
-      'Mid-client-5fq_PtORQ2LIktjf'
-    );
+    script.src = SNAP_SCRIPT_URL;
+    script.setAttribute('data-client-key', SNAP_CLIENT_KEY);
     script.async = true;
-
+    script.onerror = () => setError('Gagal memuat halaman pembayaran Midtrans');
     document.body.appendChild(script);
   }, []);
 
-  // 🔥 FETCH BOOKING
   useEffect(() => {
     if (!bookingId) return;
+    let cancelled = false;
 
-    const fetchBooking = async () => {
+    const load = async () => {
       try {
-        setLoading(true);
-        setError('');
+        const bookingRes = await bookingApi.get(`/bookings/${bookingId}`);
+        if (cancelled) return;
 
-        console.log('BOOKING ID:', bookingId);
-
-        const res = await fetch(
-          `${API_BOOKING}/bookings/${bookingId}`
-        );
-
-        if (res.status === 404) {
-          setError('Booking tidak ditemukan');
-          return;
-        }
-
-        const json = await res.json();
-        console.log('BOOKING RESPONSE:', json);
-
-        // 🔥 FIX: HANDLE nested response
-        const data = json.data || json;
-
-        if (!data || !data.id) {
-          setError('Booking tidak valid');
-          return;
-        }
-
+        const data: Booking = bookingRes.data;
         setBooking(data);
-      } catch (err) {
-        console.error(err);
-        setError('Gagal mengambil booking');
+
+        if (data.status !== 'PENDING_PAYMENT') {
+          setError(`Booking ini berstatus ${data.status} dan tidak bisa dibayar`);
+          return;
+        }
+
+        // GET hanya membaca. Kalau transaksi Snap belum pernah dibuat,
+        // barulah kita memintanya lewat POST -- endpoint GET tidak boleh
+        // punya efek samping.
+        try {
+          const tokenRes = await paymentApi.get('/payments/snap-token', {
+            params: { booking_id: data.id },
+          });
+          if (!cancelled) setSnapToken(tokenRes.data?.snap_token ?? tokenRes.data?.token ?? '');
+        } catch {
+          const initRes = await paymentApi.post('/payments/snap-token', { booking_id: data.id });
+          if (!cancelled) setSnapToken(initRes.data?.snap_token ?? initRes.data?.token ?? '');
+        }
+      } catch (err: unknown) {
+        if (cancelled) return;
+        const status =
+          typeof err === 'object' && err !== null && 'response' in err
+            ? (err as { response?: { status?: number } }).response?.status
+            : undefined;
+        setError(status === 404 ? 'Booking tidak ditemukan' : 'Gagal menyiapkan pembayaran');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
-    fetchBooking();
+    void load();
+    return () => {
+      cancelled = true;
+    };
   }, [bookingId]);
 
-  // 🔥 FETCH SNAP TOKEN
-  useEffect(() => {
-    if (!booking) return;
+  const pay = useCallback(() => {
+    const snap = (window as unknown as { snap?: SnapApi }).snap;
+    if (!snap) {
+      toast('Halaman pembayaran masih dimuat, coba lagi sebentar');
+      return;
+    }
+    if (!snapToken) return;
 
-    const fetchToken = async () => {
-      try {
-        const res = await fetch(
-          `/api/payments/snap-token?booking_id=${booking.id}`
-        );
+    setPaying(true);
+    snap.pay(snapToken, {
+      onSuccess: () => {
+        // Konfirmasi belum tentu selesai saat ini: webhook Midtrans,
+        // outbox, dan Kafka butuh beberapa detik. Halaman status yang
+        // menunggu perubahannya.
+        toast.success('Pembayaran diterima, sedang dikonfirmasi');
+        router.push(`/booking-status/${bookingId}`);
+      },
+      onPending: () => {
+        toast('Pembayaran menunggu penyelesaian');
+        router.push(`/booking-status/${bookingId}`);
+      },
+      onError: () => {
+        toast.error('Pembayaran gagal');
+        setPaying(false);
+      },
+      onClose: () => {
+        toast('Pembayaran dibatalkan. Kamu bisa mencoba lagi sebelum booking kedaluwarsa.');
+        setPaying(false);
+      },
+    });
+  }, [snapToken, bookingId, router]);
 
-        const json = await res.json();
-        console.log('SNAP TOKEN:', json);
-
-        const token = json.token || json.snap_token;
-
-        if (!token) {
-          setError('Token pembayaran tidak ditemukan');
-          return;
-        }
-
-        setSnapToken(token);
-      } catch (err) {
-        console.error(err);
-        setError('Gagal mengambil token pembayaran');
-      }
-    };
-
-    fetchToken();
-  }, [booking]);
-
-  // 🔥 LOADING
-  if (!bookingId || loading) {
-    return <p className="p-4">Memuat...</p>;
+  if (loading) {
+    return <p className="text-[var(--color-text-secondary)]">Memuat...</p>;
   }
 
-  // 🔥 ERROR
-  if (error) {
+  const displayError = CONFIG_ERROR || error;
+
+  if (displayError || !booking) {
     return (
-      <div className="p-4">
-        <h1 className="text-xl font-bold">Pembayaran</h1>
-        <p className="text-red-500 mt-2">{error}</p>
+      <section className="mx-auto max-w-2xl rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-sm">
+        <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">Pembayaran</h1>
+        <p className="mt-3 text-sm text-[var(--color-error)]">{displayError || 'Booking tidak ditemukan'}</p>
         <button
-          onClick={() => router.push('/')}
-          className="mt-4 bg-gray-200 px-4 py-2 rounded"
+          onClick={() => router.push('/my-bookings')}
+          className="mt-5 rounded-xl border border-[var(--color-border)] px-4 py-2 text-sm font-medium"
         >
-          Kembali ke beranda
+          Ke Pesanan Saya
         </button>
-      </div>
+      </section>
     );
   }
 
-  // 🔥 UI NORMAL
-  return (
-    <div className="p-4">
-      <h1 className="text-xl font-bold">Pembayaran</h1>
+  const canPay = Boolean(snapToken) && !paying;
 
-      <p className="mt-2">Booking ID: {booking.id}</p>
-      <p>Resource: {booking.resource_id}</p>
-      <p>Total: Rp {booking.total_amount}</p>
+  return (
+    <section className="mx-auto max-w-2xl rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-sm">
+      <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">Pembayaran</h1>
+      <p className="mt-2 font-mono text-xs text-[var(--color-text-secondary)]">{booking.id}</p>
+
+      <div className="mt-5 space-y-1 text-sm text-[var(--color-text-secondary)]">
+        <p>Trip: {booking.resource_id}</p>
+        <p>Jumlah kursi: {booking.quantity}</p>
+        <p className="text-lg font-semibold text-[var(--color-text-primary)]">
+          Total: {formatRupiah(booking.total_amount)}
+        </p>
+        {booking.expires_at ? (
+          <p className="text-xs">
+            Bayar sebelum {new Date(booking.expires_at).toLocaleString('id-ID')}
+          </p>
+        ) : null}
+      </div>
 
       <button
-        onClick={() => {
-          const snap = (window as any).snap;
-
-          if (!snap) {
-            alert('Snap belum siap, refresh dulu');
-            return;
-          }
-
-          if (!snapToken) {
-            alert('Token belum ada');
-            return;
-          }
-
-          console.log('PAY:', snapToken);
-
-          snap.pay(snapToken, {
-            onSuccess: () => {
-              alert('Pembayaran berhasil');
-              router.push(`/booking-status/${booking.id}`);
-            },
-            onPending: () => {
-              alert('Pembayaran pending');
-            },
-            onError: () => {
-              alert('Pembayaran gagal');
-            },
-            onClose: () => {
-              alert('Pembayaran dibatalkan');
-            },
-          });
-        }}
-        className="mt-4 bg-blue-600 text-white px-4 py-2 rounded"
+        onClick={pay}
+        disabled={!canPay}
+        className="mt-6 rounded-xl bg-[var(--color-primary)] px-5 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-300"
       >
-        Bayar Sekarang
+        {paying ? 'Memproses...' : !snapToken ? 'Menyiapkan pembayaran...' : 'Bayar sekarang'}
       </button>
-    </div>
+    </section>
   );
 }

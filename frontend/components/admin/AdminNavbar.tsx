@@ -1,12 +1,13 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
+import { clearToken } from '@/lib/auth';
 
 export default function AdminNavbar() {
   const router = useRouter();
 
   const handleLogout = () => {
-    localStorage.removeItem('admin_logged_in');
+    clearToken();
     router.push('/admin/login');
   };
 

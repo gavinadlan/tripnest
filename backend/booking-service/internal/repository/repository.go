@@ -12,10 +12,13 @@ import (
 )
 
 type BookingRepository interface {
-	Create(ctx context.Context, booking *model.Booking) error
+	// CreateWithEvent menyimpan booking dan event outbox-nya dalam SATU
+	// transaksi. Sebelumnya insert outbox dijalankan di goroutine terpisah
+	// setelah commit, sehingga booking bisa tersimpan tanpa event -- itu
+	// membatalkan seluruh gunanya pola outbox.
+	CreateWithEvent(ctx context.Context, booking *model.Booking, topic string, payload interface{}) error
 	GetByID(ctx context.Context, id string) (*model.Booking, error)
-	GetByUserID(ctx context.Context, userID string) ([]model.Booking, error)
-	List(ctx context.Context, status, createdDate string) ([]model.Booking, error)
+	List(ctx context.Context, filter ListFilter) ([]model.Booking, error)
 	UpdateStatusIfCurrent(ctx context.Context, id, currentStatus, nextStatus string) (bool, error)
 	ExpirePendingBookings(ctx context.Context, now time.Time) ([]string, error)
 	AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error
@@ -55,30 +58,55 @@ func (r *postgresRepository) Close() {
 	r.db.Close()
 }
 
-func (r *postgresRepository) Create(ctx context.Context, b *model.Booking) error {
-	query := `
-		INSERT INTO bookings (user_id, resource_id, total_amount, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+func (r *postgresRepository) CreateWithEvent(ctx context.Context, b *model.Booking, topic string, payload interface{}) error {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to start tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	insertBooking := `
+		INSERT INTO bookings (user_id, resource_id, quantity, total_amount, status, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, created_at, updated_at, expires_at`
 
-	err := r.db.QueryRow(ctx, query,
+	if err := tx.QueryRow(ctx, insertBooking,
 		b.UserID,
 		b.ResourceID,
+		b.Quantity,
 		b.TotalAmount,
 		model.BookingStatusPendingPayment,
 		b.ExpiresAt,
-	).Scan(&b.ID, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt)
-
-	if err != nil {
+	).Scan(&b.ID, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt); err != nil {
 		return fmt.Errorf("failed to create booking: %w", err)
 	}
 	b.Status = model.BookingStatusPendingPayment
-	return nil
+
+	// Payload event butuh id booking, yang baru diketahui setelah insert
+	// di atas. Karena keduanya berada dalam transaksi yang sama, event
+	// hanya ada bila booking-nya benar-benar tersimpan, dan sebaliknya.
+	if setter, ok := payload.(interface{ SetBookingID(string) }); ok {
+		setter.SetBookingID(b.ID)
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to encode outbox payload: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events (topic, message_key, payload, status, retry_count, created_at, updated_at)
+		VALUES ($1, $2, $3, 'PENDING', 0, NOW(), NOW())
+	`, topic, b.ID, data); err != nil {
+		return fmt.Errorf("failed to enqueue outbox event: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (r *postgresRepository) GetByID(ctx context.Context, id string) (*model.Booking, error) {
 	query := `
-		SELECT id, user_id, resource_id, total_amount, status, expires_at, created_at, updated_at
+		SELECT id, user_id, resource_id, quantity, total_amount, status, expires_at, created_at, updated_at
 		FROM bookings
 		WHERE id = $1
 	`
@@ -87,6 +115,7 @@ func (r *postgresRepository) GetByID(ctx context.Context, id string) (*model.Boo
 		&booking.ID,
 		&booking.UserID,
 		&booking.ResourceID,
+		&booking.Quantity,
 		&booking.TotalAmount,
 		&booking.Status,
 		&booking.ExpiresAt,
@@ -102,48 +131,36 @@ func (r *postgresRepository) GetByID(ctx context.Context, id string) (*model.Boo
 	return &booking, nil
 }
 
-func (r *postgresRepository) GetByUserID(ctx context.Context, userID string) ([]model.Booking, error) {
-	query := `
-		SELECT id, user_id, resource_id, total_amount, status, expires_at, created_at, updated_at
-		FROM bookings
-		WHERE user_id = $1
-		ORDER BY created_at DESC
-	`
-	rows, err := r.db.Query(ctx, query, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	bookings := make([]model.Booking, 0)
-	for rows.Next() {
-		var booking model.Booking
-		if err := rows.Scan(
-			&booking.ID,
-			&booking.UserID,
-			&booking.ResourceID,
-			&booking.TotalAmount,
-			&booking.Status,
-			&booking.ExpiresAt,
-			&booking.CreatedAt,
-			&booking.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		bookings = append(bookings, booking)
-	}
-	return bookings, rows.Err()
+// ListFilter membatasi hasil List. UserID yang tidak kosong membatasi
+// hasil hanya pada booking milik user tersebut -- handler mengisinya dari
+// JWT untuk pemanggil non-admin, sehingga endpoint yang sama aman dipakai
+// user biasa maupun admin.
+type ListFilter struct {
+	UserID      string
+	Status      string
+	CreatedDate string
+	Limit       int
+	Offset      int
 }
 
-func (r *postgresRepository) List(ctx context.Context, status, createdDate string) ([]model.Booking, error) {
+func (r *postgresRepository) List(ctx context.Context, filter ListFilter) ([]model.Booking, error) {
+	if filter.Limit <= 0 || filter.Limit > 100 {
+		filter.Limit = 50
+	}
+	if filter.Offset < 0 {
+		filter.Offset = 0
+	}
+
 	query := `
-		SELECT id, user_id, resource_id, total_amount, status, expires_at, created_at, updated_at
+		SELECT id, user_id, resource_id, quantity, total_amount, status, expires_at, created_at, updated_at
 		FROM bookings
-		WHERE ($1 = '' OR status = $1)
-		  AND ($2 = '' OR DATE(created_at) = $2::date)
+		WHERE ($1 = '' OR user_id = $1::uuid)
+		  AND ($2 = '' OR status = $2)
+		  AND ($3 = '' OR DATE(created_at) = $3::date)
 		ORDER BY created_at DESC
+		LIMIT $4 OFFSET $5
 	`
-	rows, err := r.db.Query(ctx, query, status, createdDate)
+	rows, err := r.db.Query(ctx, query, filter.UserID, filter.Status, filter.CreatedDate, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -156,6 +173,7 @@ func (r *postgresRepository) List(ctx context.Context, status, createdDate strin
 			&booking.ID,
 			&booking.UserID,
 			&booking.ResourceID,
+			&booking.Quantity,
 			&booking.TotalAmount,
 			&booking.Status,
 			&booking.ExpiresAt,

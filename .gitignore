@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# Node / Next
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+
+# macOS / iCloud
+.DS_Store
+._*
+*\ 2.*
+*\ 3.*
+_to_delete/
+
+# Editor
+.idea/
+.vscode/

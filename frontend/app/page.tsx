@@ -35,14 +35,9 @@ export default function HomePage() {
 
   const onBook = (trip: Trip) => {
     setBookingTripId(trip.id);
-    const params = new URLSearchParams({
-      tripId: trip.id,
-      title: trip.title,
-      destination: trip.destination,
-      price: String(trip.price),
-      date: trip.date,
-    });
-    router.push(`/booking?${params.toString()}`);
+    // Hanya id yang dioper. Judul, tanggal, dan harga diambil ulang dari
+    // server di halaman booking -- harga tidak boleh datang dari URL.
+    router.push(`/booking?tripId=${encodeURIComponent(trip.id)}`);
   };
 
   return (

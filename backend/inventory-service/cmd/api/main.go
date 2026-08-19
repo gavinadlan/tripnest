@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gavinadlan/tripnest/backend/common/auth"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/db"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/handler"
@@ -29,6 +30,11 @@ func main() {
 	cfg := config.Load()
 	log.Printf("Inventory service DB target: %s", dbNameFromURL(cfg.DatabaseURL))
 
+	verifier, err := auth.NewVerifier(cfg.JWTSecret)
+	if err != nil {
+		log.Fatalf("Konfigurasi auth tidak valid: %v", err)
+	}
+
 	db.RunMigrations(cfg.DatabaseURL)
 
 	repo, err := repository.NewPostgresRepository(cfg.DatabaseURL)
@@ -41,7 +47,7 @@ func main() {
 	defer producer.Close()
 
 	svc := service.NewInventoryService(repo, producer)
-	h := handler.NewHandler(svc)
+	h := handler.NewHandler(svc, verifier)
 
 	bookingCreatedConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.created", inventoryConsumerGroup)
 	defer bookingCreatedConsumer.Close()
@@ -55,8 +61,9 @@ func main() {
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 	server := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: corsMiddleware(mux),
+		Addr:              ":" + cfg.Port,
+		Handler:           corsMiddleware(cfg.CORSOrigins, mux),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -67,7 +74,12 @@ func main() {
 			msg, err := bookingCreatedConsumer.ReadMessage(ctx)
 			if err != nil {
 				log.Printf("booking.created consumer error: %v", err)
-				break
+				if ctx.Err() != nil {
+					return
+				}
+				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
+				// consumer sampai container di-restart.
+				continue
 			}
 			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
@@ -94,7 +106,12 @@ func main() {
 			msg, err := paymentSuccessConsumer.ReadMessage(ctx)
 			if err != nil {
 				log.Printf("payment.success consumer error: %v", err)
-				break
+				if ctx.Err() != nil {
+					return
+				}
+				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
+				// consumer sampai container di-restart.
+				continue
 			}
 			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
@@ -121,7 +138,12 @@ func main() {
 			msg, err := paymentFailedConsumer.ReadMessage(ctx)
 			if err != nil {
 				log.Printf("payment.failed consumer error: %v", err)
-				break
+				if ctx.Err() != nil {
+					return
+				}
+				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
+				// consumer sampai container di-restart.
+				continue
 			}
 			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
@@ -148,7 +170,12 @@ func main() {
 			msg, err := bookingExpiredConsumer.ReadMessage(ctx)
 			if err != nil {
 				log.Printf("booking.expired consumer error: %v", err)
-				break
+				if ctx.Err() != nil {
+					return
+				}
+				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
+				// consumer sampai container di-restart.
+				continue
 			}
 			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
@@ -229,9 +256,17 @@ func dbNameFromURL(raw string) string {
 	return strings.TrimPrefix(parsed.Path, "/")
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+func corsMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		if origin := r.Header.Get("Origin"); allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")

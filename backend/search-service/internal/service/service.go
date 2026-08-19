@@ -10,6 +10,7 @@ import (
 type SearchService interface {
 	SearchListings(ctx context.Context, params *model.SearchParams) ([]*model.Listing, int64, error)
 	ListTrips(ctx context.Context) ([]*model.Listing, error)
+	GetTrip(ctx context.Context, id string) (*model.Listing, error)
 	CreateTrip(ctx context.Context, trip *model.Listing) error
 	UpdateTrip(ctx context.Context, id string, trip *model.Listing) error
 	DeleteTrip(ctx context.Context, id string) error
@@ -34,6 +35,10 @@ func (s *searchService) SeedListings(ctx context.Context) error {
 
 func (s *searchService) ListTrips(ctx context.Context) ([]*model.Listing, error) {
 	return s.repo.List(ctx)
+}
+
+func (s *searchService) GetTrip(ctx context.Context, id string) (*model.Listing, error) {
+	return s.repo.GetByID(ctx, id)
 }
 
 func (s *searchService) CreateTrip(ctx context.Context, trip *model.Listing) error {

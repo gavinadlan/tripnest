@@ -12,6 +12,8 @@ type Config struct {
 	DatabaseURL  string
 	KafkaBrokers []string
 	BookingURL   string
+	JWTSecret    string
+	CORSOrigins  []string
 	Midtrans     MidtransConfig
 }
 
@@ -30,6 +32,9 @@ func Load() *Config {
 		DatabaseURL:  env.GetString("DATABASE_URL", "postgres://postgres:postgres@localhost:5434/tripnest_payments?sslmode=disable"),
 		KafkaBrokers: strings.Split(brokers, ","),
 		BookingURL:   env.GetString("BOOKING_SERVICE_URL", "http://booking-service:8081"),
+		// Tanpa default: secret kosong ditolak saat startup.
+		JWTSecret:   env.GetString("JWT_SECRET", ""),
+		CORSOrigins: splitAndTrim(env.GetString("CORS_ORIGINS", "http://localhost:3000")),
 		Midtrans: MidtransConfig{
 			MerchantID:   env.GetString("MIDTRANS_MERCHANT_ID", ""),
 			ClientKey:    env.GetString("MIDTRANS_CLIENT_KEY", ""),
@@ -37,4 +42,15 @@ func Load() *Config {
 			IsProduction: isProduction,
 		},
 	}
+}
+
+func splitAndTrim(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

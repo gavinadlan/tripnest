@@ -22,6 +22,13 @@ type CreateSnapTransactionRequest struct {
 	OrderID         string
 	GrossAmount     int64
 	CustomerDetails CustomerDetails
+	// ExpiresAt menyelaraskan masa berlaku Snap dengan masa berlaku booking.
+	// Tanpa ini token Snap hidup ~24 jam sementara booking kedaluwarsa
+	// dalam 15 menit, sehingga user masih bisa membayar booking yang sudah
+	// mati -- uang masuk tapi booking tetap EXPIRED.
+	ExpiresAt time.Time
+	// ItemName muncul di halaman pembayaran dan struk Midtrans.
+	ItemName string
 }
 
 type CustomerDetails struct {
@@ -65,6 +72,26 @@ func (c *Client) CreateSnapTransaction(ctx context.Context, req CreateSnapTransa
 		},
 	}
 
+	if itemName := req.ItemName; itemName != "" {
+		payload["item_details"] = []map[string]interface{}{{
+			"id":       req.OrderID,
+			"name":     truncate(itemName, 50), // Midtrans membatasi 50 karakter
+			"price":    req.GrossAmount,
+			"quantity": 1,
+		}}
+	}
+
+	if !req.ExpiresAt.IsZero() {
+		minutes := int(time.Until(req.ExpiresAt).Minutes())
+		if minutes < 1 {
+			minutes = 1
+		}
+		payload["expiry"] = map[string]interface{}{
+			"unit":     "minute",
+			"duration": minutes,
+		}
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal midtrans payload: %w", err)
@@ -90,7 +117,8 @@ func (c *Client) CreateSnapTransaction(ctx context.Context, req CreateSnapTransa
 	if err != nil {
 		return nil, fmt.Errorf("failed reading midtrans response: %w", err)
 	}
-	log.Printf("MIDTRANS RAW RESPONSE: %s", string(responseBody))
+	// Body respons memuat snap token; jangan pernah dicatat utuh di log.
+	log.Printf("Midtrans snap response order_id=%s status=%d", req.OrderID, resp.StatusCode)
 
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("midtrans error status=%d body=%s", resp.StatusCode, string(responseBody))
@@ -102,4 +130,11 @@ func (c *Client) CreateSnapTransaction(ctx context.Context, req CreateSnapTransa
 	}
 
 	return &out, nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }

@@ -72,7 +72,13 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_users?sslmode=disable
       PORT: 8080
-      JWT_SECRET: dev-secret
+      # Wajib diisi di .env host. Service menolak start bila kosong atau
+      # kurang dari 32 karakter.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # Bootstrap admin pertama. Menggantikan kredensial hardcoded di frontend.
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@tripnest.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD wajib diisi, minimal 8 karakter}
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,12 +95,19 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_booking?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       PORT: 8081
-      JWT_SECRET: dev-secret
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # Sumber harga resmi sebuah trip. Harga tidak lagi datang dari client.
+      CATALOG_SERVICE_URL: http://search-service:8083
+      BOOKING_EXPIRY_MINUTES: ${BOOKING_EXPIRY_MINUTES:-15}
+      BOOKING_EXPIRY_INTERVAL_SECONDS: ${BOOKING_EXPIRY_INTERVAL_SECONDS:-60}
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      search-service:
+        condition: service_started
 
   payment-service:
     build:
@@ -108,6 +121,8 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_payments?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       PORT: 8082
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       BOOKING_SERVICE_URL: http://booking-service:8081
       MIDTRANS_MERCHANT_ID: G249068382
       MIDTRANS_CLIENT_KEY: ${MIDTRANS_CLIENT_KEY}
@@ -131,6 +146,8 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/tripnest_inventory?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       PORT: 8084
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,6 +163,8 @@ services:
       - "8083:8083"
     environment:
       PORT: 8083
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       MONGO_URI: mongodb://mongo:27017/tripnest_search
       REDIS_ADDR: redis:6379
     depends_on:

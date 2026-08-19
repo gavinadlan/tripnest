@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { clearToken } from '@/lib/auth';
 import { usePathname } from 'next/navigation';
 import toast from 'react-hot-toast';
 
@@ -18,7 +19,7 @@ export default function AdminTopbar() {
   const title = titleMap[pathname] || 'Dashboard Admin';
 
   const logoutAdmin = () => {
-    localStorage.removeItem('admin_logged_in');
+    clearToken();
     toast.success('Berhasil keluar dari admin');
     router.push('/admin/login');
   };

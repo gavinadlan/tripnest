@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gavinadlan/tripnest/backend/common/auth"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/db"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/handler"
@@ -39,6 +40,11 @@ func main() {
 		log.Fatal(errors.New("missing MIDTRANS_SERVER_KEY or MIDTRANS_CLIENT_KEY"))
 	}
 
+	verifier, err := auth.NewVerifier(cfg.JWTSecret)
+	if err != nil {
+		log.Fatalf("Konfigurasi auth tidak valid: %v", err)
+	}
+
 	db.RunMigrations(cfg.DatabaseURL)
 
 	repo, err := repository.NewPostgresRepository(cfg.DatabaseURL)
@@ -51,8 +57,8 @@ func main() {
 	defer producer.Close()
 
 	midtransClient := midtrans.NewClient(cfg.Midtrans.ServerKey, cfg.Midtrans.IsProduction)
-	svc := service.NewPaymentService(repo, producer, midtransClient, cfg.Midtrans.ServerKey, cfg.BookingURL)
-	h := handler.NewHandler(svc)
+	svc := service.NewPaymentService(repo, producer, midtransClient, cfg.Midtrans.ServerKey, cfg.BookingURL, verifier)
+	h := handler.NewHandler(svc, verifier)
 
 	consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.created", paymentConsumerGroup)
 	defer consumer.Close()
@@ -61,8 +67,9 @@ func main() {
 	h.RegisterRoutes(mux)
 
 	server := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: corsMiddleware(mux),
+		Addr:              ":" + cfg.Port,
+		Handler:           corsMiddleware(cfg.CORSOrigins, mux),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	log.Println("Payment Service Started (Listening for booking.created)")
@@ -74,8 +81,13 @@ func main() {
 		for {
 			msg, err := consumer.ReadMessage(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				// Jangan break: satu gangguan jaringan sesaat tidak boleh
+				// mematikan consumer sampai container di-restart.
 				log.Printf("Consumer error: %v", err)
-				break
+				continue
 			}
 
 			processed, err := repo.MarkMessageProcessed(ctx, paymentConsumerGroup, msg.Topic, string(msg.Key))
@@ -94,7 +106,12 @@ func main() {
 			}
 
 			log.Printf("Received booking event: %v", event.BookingID)
-			go svc.ProcessPayment(ctx, event)
+			// Dijalankan sinkron dan error-nya diperiksa. Versi lama
+			// memakai `go svc.ProcessPayment(...)` sehingga kegagalan
+			// pembuatan transaksi Snap hilang tanpa jejak.
+			if err := svc.ProcessPayment(ctx, event); err != nil {
+				log.Printf("Gagal menyiapkan pembayaran booking_id=%s: %v", event.BookingID, err)
+			}
 		}
 	}()
 
@@ -165,9 +182,17 @@ func dbNameFromURL(raw string) string {
 	return strings.TrimPrefix(parsed.Path, "/")
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+func corsMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		if origin := r.Header.Get("Origin"); allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
