@@ -5,6 +5,11 @@ import (
 )
 
 const (
+	// BookingStatusPendingSeat adalah keadaan awal setiap booking: sudah
+	// tercatat, tapi kursinya belum tentu ada. Booking baru pindah ke
+	// PENDING_PAYMENT setelah catalog-service benar-benar menahan kursi,
+	// dan hanya dari situ pembayaran boleh disiapkan.
+	BookingStatusPendingSeat    = "PENDING_SEAT"
 	BookingStatusPendingPayment = "PENDING_PAYMENT"
 	BookingStatusConfirmed      = "CONFIRMED"
 	BookingStatusCancelled      = "CANCELLED"

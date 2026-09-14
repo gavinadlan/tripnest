@@ -23,12 +23,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const inventoryConsumerGroup = "inventory-service-group"
+const catalogConsumerGroup = "inventory-service-group"
 
 func main() {
 	godotenv.Load()
 	cfg := config.Load()
-	log.Printf("Inventory service DB target: %s", dbNameFromURL(cfg.DatabaseURL))
+	log.Printf("Catalog service DB target: %s", dbNameFromURL(cfg.DatabaseURL))
 
 	verifier, err := auth.NewVerifier(cfg.JWTSecret)
 	if err != nil {
@@ -46,17 +46,8 @@ func main() {
 	producer := msgbroker.NewProducer(cfg.KafkaBrokers)
 	defer producer.Close()
 
-	svc := service.NewInventoryService(repo, producer)
+	svc := service.NewCatalogService(repo)
 	h := handler.NewHandler(svc, verifier)
-
-	bookingCreatedConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.created", inventoryConsumerGroup)
-	defer bookingCreatedConsumer.Close()
-	paymentSuccessConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "payment.success", inventoryConsumerGroup)
-	defer paymentSuccessConsumer.Close()
-	paymentFailedConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "payment.failed", inventoryConsumerGroup)
-	defer paymentFailedConsumer.Close()
-	bookingExpiredConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.expired", inventoryConsumerGroup)
-	defer bookingExpiredConsumer.Close()
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
@@ -69,171 +60,77 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		for {
-			msg, err := bookingCreatedConsumer.ReadMessage(ctx)
-			if err != nil {
-				log.Printf("booking.created consumer error: %v", err)
-				if ctx.Err() != nil {
-					return
+	// Keempat consumer memakai alur yang sama: baca, tandai sudah
+	// diproses, decode, jalankan. Sebelumnya blok ini disalin empat kali
+	// di file yang sama.
+	subscriptions := []subscription{
+		{
+			topic: "booking.created",
+			apply: func(ctx context.Context, value []byte) error {
+				var event model.BookingCreatedEvent
+				if err := json.Unmarshal(value, &event); err != nil {
+					return err
 				}
-				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
-				// consumer sampai container di-restart.
-				continue
-			}
-			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
-			if err != nil {
-				log.Printf("failed to mark booking.created message: %v", err)
-				continue
-			}
-			if !processed {
-				continue
-			}
-
-			var event model.BookingCreatedEvent
-			if err := json.Unmarshal(msg.Value, &event); err != nil {
-				log.Printf("invalid booking.created payload: %v", err)
-				continue
-			}
-			if err := svc.ReserveSlot(ctx, event); err != nil {
-				log.Printf("failed to reserve inventory for booking %s: %v", event.BookingID, err)
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			msg, err := paymentSuccessConsumer.ReadMessage(ctx)
-			if err != nil {
-				log.Printf("payment.success consumer error: %v", err)
-				if ctx.Err() != nil {
-					return
+				return svc.ReserveSlot(ctx, event)
+			},
+		},
+		{
+			topic: "payment.success",
+			apply: func(ctx context.Context, value []byte) error {
+				var event model.PaymentProcessedEvent
+				if err := json.Unmarshal(value, &event); err != nil {
+					return err
 				}
-				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
-				// consumer sampai container di-restart.
-				continue
-			}
-			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
-			if err != nil {
-				log.Printf("failed to mark payment.success message: %v", err)
-				continue
-			}
-			if !processed {
-				continue
-			}
-
-			var event model.PaymentProcessedEvent
-			if err := json.Unmarshal(msg.Value, &event); err != nil {
-				log.Printf("invalid payment.success payload: %v", err)
-				continue
-			}
-			if err := svc.ConfirmReservation(ctx, event.BookingID); err != nil {
-				log.Printf("failed to confirm reservation for booking %s: %v", event.BookingID, err)
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			msg, err := paymentFailedConsumer.ReadMessage(ctx)
-			if err != nil {
-				log.Printf("payment.failed consumer error: %v", err)
-				if ctx.Err() != nil {
-					return
+				return svc.ConfirmReservation(ctx, event.BookingID)
+			},
+		},
+		{
+			topic: "payment.failed",
+			apply: func(ctx context.Context, value []byte) error {
+				var event model.PaymentProcessedEvent
+				if err := json.Unmarshal(value, &event); err != nil {
+					return err
 				}
-				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
-				// consumer sampai container di-restart.
-				continue
-			}
-			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
-			if err != nil {
-				log.Printf("failed to mark payment.failed message: %v", err)
-				continue
-			}
-			if !processed {
-				continue
-			}
+				return svc.ReleaseReservation(ctx, event.BookingID)
+			},
+		},
+		{
+			topic: "booking.expired",
+			apply: func(ctx context.Context, value []byte) error {
+				var event model.BookingExpiredEvent
+				if err := json.Unmarshal(value, &event); err != nil {
+					return err
+				}
+				return svc.ReleaseReservation(ctx, event.BookingID)
+			},
+		},
+		{
+			// Pembatalan eksplisit melepas kursi walau reservasinya sudah
+			// CONFIRMED. Tanpa cabang ini, kursi booking yang dibatalkan
+			// hilang dari peredaran selamanya.
+			topic: "booking.cancelled",
+			apply: func(ctx context.Context, value []byte) error {
+				var event model.BookingCancelledEvent
+				if err := json.Unmarshal(value, &event); err != nil {
+					return err
+				}
+				return svc.ReleaseCancelled(ctx, event.BookingID)
+			},
+		},
+	}
 
-			var event model.PaymentProcessedEvent
-			if err := json.Unmarshal(msg.Value, &event); err != nil {
-				log.Printf("invalid payment.failed payload: %v", err)
-				continue
-			}
-			if err := svc.ReleaseReservation(ctx, event.BookingID); err != nil {
-				log.Printf("failed to release reservation for booking %s: %v", event.BookingID, err)
-			}
-		}
-	}()
+	for _, sub := range subscriptions {
+		consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, sub.topic, catalogConsumerGroup)
+		defer consumer.Close()
+		go consume(ctx, consumer, repo, sub)
+	}
+
+	go runOutboxWorker(ctx, repo, producer)
 
 	go func() {
-		for {
-			msg, err := bookingExpiredConsumer.ReadMessage(ctx)
-			if err != nil {
-				log.Printf("booking.expired consumer error: %v", err)
-				if ctx.Err() != nil {
-					return
-				}
-				// Jangan break: gangguan Kafka sesaat tidak boleh mematikan
-				// consumer sampai container di-restart.
-				continue
-			}
-			processed, err := repo.MarkMessageProcessed(ctx, inventoryConsumerGroup, msg.Topic, string(msg.Key))
-			if err != nil {
-				log.Printf("failed to mark booking.expired message: %v", err)
-				continue
-			}
-			if !processed {
-				continue
-			}
-
-			var event model.BookingExpiredEvent
-			if err := json.Unmarshal(msg.Value, &event); err != nil {
-				log.Printf("invalid booking.expired payload: %v", err)
-				continue
-			}
-			if err := svc.ReleaseReservation(ctx, event.BookingID); err != nil {
-				log.Printf("failed to release expired reservation for booking %s: %v", event.BookingID, err)
-			}
-		}
-	}()
-
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				outboxEvents, err := repo.FetchPendingOutboxEvents(ctx, 50)
-				if err != nil {
-					log.Printf("Failed to fetch outbox events: %v", err)
-					continue
-				}
-				for _, outboxEvent := range outboxEvents {
-					var payload map[string]interface{}
-					if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
-						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-						continue
-					}
-					if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
-						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-						continue
-					}
-					if err := repo.MarkOutboxEventPublished(ctx, outboxEvent.ID); err != nil {
-						log.Printf("failed to mark outbox published: %v", err)
-						continue
-					}
-					log.Printf("Published outbox event topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
-				}
-			}
-		}
-	}()
-
-	go func() {
-		log.Printf("Inventory service API running on port %s", cfg.Port)
+		log.Printf("Catalog service API running on port %s", cfg.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("inventory service HTTP error: %v", err)
+			log.Fatalf("catalog service HTTP error: %v", err)
 		}
 	}()
 
@@ -244,7 +141,74 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("failed to shutdown inventory HTTP server: %v", err)
+		log.Printf("failed to shutdown catalog HTTP server: %v", err)
+	}
+}
+
+type subscription struct {
+	topic string
+	apply func(ctx context.Context, value []byte) error
+}
+
+func consume(ctx context.Context, consumer *msgbroker.Consumer, repo repository.InventoryRepository, sub subscription) {
+	log.Printf("Listening for %s events...", sub.topic)
+	for {
+		msg, err := consumer.ReadMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Jangan berhenti: gangguan Kafka sesaat tidak boleh mematikan
+			// consumer sampai container di-restart.
+			log.Printf("%s consumer error: %v", sub.topic, err)
+			continue
+		}
+
+		processed, err := repo.MarkMessageProcessed(ctx, catalogConsumerGroup, msg.Topic, string(msg.Key))
+		if err != nil {
+			log.Printf("failed to mark %s message: %v", sub.topic, err)
+			continue
+		}
+		if !processed {
+			continue
+		}
+
+		if err := sub.apply(ctx, msg.Value); err != nil {
+			log.Printf("failed to apply %s key=%s: %v", sub.topic, string(msg.Key), err)
+		}
+	}
+}
+
+func runOutboxWorker(ctx context.Context, repo repository.InventoryRepository, producer *msgbroker.Producer) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			outboxEvents, err := repo.FetchPendingOutboxEvents(ctx, 50)
+			if err != nil {
+				log.Printf("Failed to fetch outbox events: %v", err)
+				continue
+			}
+			for _, outboxEvent := range outboxEvents {
+				var payload map[string]interface{}
+				if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
+					_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
+					continue
+				}
+				if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
+					_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
+					continue
+				}
+				if err := repo.MarkOutboxEventPublished(ctx, outboxEvent.ID); err != nil {
+					log.Printf("failed to mark outbox published: %v", err)
+					continue
+				}
+				log.Printf("Published outbox event topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
+			}
+		}
 	}
 }
 

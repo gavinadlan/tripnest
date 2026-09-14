@@ -9,7 +9,6 @@ import (
 
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/model"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -18,10 +17,11 @@ type ListingRepository interface {
 	Search(ctx context.Context, params *model.SearchParams) ([]*model.Listing, int64, error)
 	List(ctx context.Context) ([]*model.Listing, error)
 	GetByID(ctx context.Context, id string) (*model.Listing, error)
-	Create(ctx context.Context, listing *model.Listing) error
-	Update(ctx context.Context, id string, listing *model.Listing) error
+	// Upsert dan Delete hanya dipanggil dari consumer event. Sengaja
+	// upsert, bukan insert: event yang sama boleh datang dua kali dan
+	// hasil akhirnya harus tetap sama.
+	Upsert(ctx context.Context, listing *model.Listing) error
 	Delete(ctx context.Context, id string) error
-	Seed(ctx context.Context) error
 }
 
 type mongoRepository struct {
@@ -112,18 +112,12 @@ func (r *mongoRepository) List(ctx context.Context) ([]*model.Listing, error) {
 	return listings, nil
 }
 
-// GetByID dipakai booking-service untuk mengambil harga resmi sebuah trip.
-// Harga tidak boleh lagi datang dari request client.
+// GetByID melayani halaman detail trip di frontend. Ini read model:
+// booking-service tidak lagi membaca dari sini, melainkan dari
+// catalog-service yang memiliki datanya.
 func (r *mongoRepository) GetByID(ctx context.Context, id string) (*model.Listing, error) {
-	oid, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		// Id yang tidak berbentuk ObjectID berarti trip tidak ada,
-		// bukan kesalahan server.
-		return nil, nil
-	}
-
 	var listing model.Listing
-	if err := r.coll.FindOne(ctx, bson.M{"_id": oid}).Decode(&listing); err != nil {
+	if err := r.coll.FindOne(ctx, bson.M{"_id": id}).Decode(&listing); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, nil
 		}
@@ -132,76 +126,29 @@ func (r *mongoRepository) GetByID(ctx context.Context, id string) (*model.Listin
 	return &listing, nil
 }
 
-func (r *mongoRepository) Create(ctx context.Context, listing *model.Listing) error {
+// Upsert menulis snapshot trip apa adanya. Read model tidak menghitung
+// apa pun sendiri -- angkanya milik catalog-service.
+func (r *mongoRepository) Upsert(ctx context.Context, listing *model.Listing) error {
 	now := time.Now().UTC()
-	listing.CreatedAt = now
-	listing.UpdatedAt = now
-	res, err := r.coll.InsertOne(ctx, listing)
-	if err != nil {
-		return err
-	}
-	oid, ok := res.InsertedID.(primitive.ObjectID)
-	if !ok {
-		return errors.New("failed to parse inserted id")
-	}
-	listing.ID = oid
-	return nil
-}
-
-func (r *mongoRepository) Update(ctx context.Context, id string, listing *model.Listing) error {
-	oid, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
 	update := bson.M{
 		"$set": bson.M{
 			"title":           listing.Title,
 			"destination":     listing.Destination,
 			"price":           listing.Price,
 			"date":            listing.Date,
+			"total_slots":     listing.TotalSlots,
 			"available_slots": listing.AvailableSlots,
-			"updated_at":      time.Now().UTC(),
+			"updated_at":      listing.UpdatedAt,
 		},
+		"$setOnInsert": bson.M{"created_at": now},
 	}
-	res, err := r.coll.UpdateByID(ctx, oid, update)
-	if err != nil {
-		return err
-	}
-	if res.MatchedCount == 0 {
-		return mongo.ErrNoDocuments
-	}
-	return nil
+	_, err := r.coll.UpdateByID(ctx, listing.ID, update, options.Update().SetUpsert(true))
+	return err
 }
 
+// Delete tidak menganggap dokumen yang sudah tidak ada sebagai kesalahan:
+// trip.deleted yang terkirim ulang harus tetap berhasil.
 func (r *mongoRepository) Delete(ctx context.Context, id string) error {
-	oid, err := primitive.ObjectIDFromHex(id)
-	if err != nil {
-		return err
-	}
-	res, err := r.coll.DeleteOne(ctx, bson.M{"_id": oid})
-	if err != nil {
-		return err
-	}
-	if res.DeletedCount == 0 {
-		return mongo.ErrNoDocuments
-	}
-	return nil
-}
-
-func (r *mongoRepository) Seed(ctx context.Context) error {
-	count, _ := r.coll.CountDocuments(ctx, bson.M{})
-	if count > 0 {
-		return nil // Already seeded
-	}
-
-	listings := []interface{}{
-		model.Listing{Title: "Paris Gateway", Destination: "Paris", Price: 200, Date: "2026-06-01", AvailableSlots: 10, CreatedAt: time.Now(), UpdatedAt: time.Now()},
-		model.Listing{Title: "Tokyo Adventure", Destination: "Tokyo", Price: 300, Date: "2026-07-15", AvailableSlots: 5, CreatedAt: time.Now(), UpdatedAt: time.Now()},
-		model.Listing{Title: "New York City Break", Destination: "New York", Price: 250, Date: "2026-08-20", AvailableSlots: 8, CreatedAt: time.Now(), UpdatedAt: time.Now()},
-		model.Listing{Title: "Bali Retreat", Destination: "Bali", Price: 150, Date: "2026-09-05", AvailableSlots: 12, CreatedAt: time.Now(), UpdatedAt: time.Now()},
-		model.Listing{Title: "London Historical Tour", Destination: "London", Price: 220, Date: "2026-06-10", AvailableSlots: 15, CreatedAt: time.Now(), UpdatedAt: time.Now()},
-	}
-
-	_, err := r.coll.InsertMany(ctx, listings)
+	_, err := r.coll.DeleteOne(ctx, bson.M{"_id": id})
 	return err
 }

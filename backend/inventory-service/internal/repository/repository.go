@@ -3,22 +3,46 @@ package repository
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// ReserveOutcome membedakan tiga hasil yang perlakuannya berbeda.
+// Sebelumnya "kursi habis" dikembalikan sebagai error biasa dan berakhir
+// di log.Printf, sehingga booking tetap lanjut ke pembayaran.
+type ReserveOutcome int
+
+const (
+	ReserveOutcomeReserved ReserveOutcome = iota
+	// ReserveOutcomeDuplicate berarti reservasi untuk booking ini sudah
+	// ada. Event Kafka bisa datang dua kali; ini bukan kesalahan.
+	ReserveOutcomeDuplicate
+	// ReserveOutcomeRejected berarti kursi tidak cukup atau trip-nya sudah
+	// tidak ada. Pemanggil harus membatalkan booking-nya.
+	ReserveOutcomeRejected
+)
+
 type InventoryRepository interface {
-	ReserveSlot(ctx context.Context, bookingID, resourceID string) (bool, error)
+	// ReserveSlot menerima event booking utuh, bukan hanya id dan jumlah:
+	// isinya disalin ke inventory.reserved supaya payment-service punya
+	// semua yang dibutuhkan tanpa memanggil balik booking-service.
+	ReserveSlot(ctx context.Context, event model.BookingCreatedEvent) (ReserveOutcome, error)
 	ConfirmReservation(ctx context.Context, bookingID string) (bool, error)
-	ReleaseReservation(ctx context.Context, bookingID string) (bool, error)
-	UpsertInventory(ctx context.Context, req model.UpsertInventoryRequest) error
+	ReleaseReservation(ctx context.Context, bookingID string, allowConfirmed bool) (bool, error)
 	UpdateInventory(ctx context.Context, resourceID string, totalSlots int) error
 	GetInventoryByResourceID(ctx context.Context, resourceID string) (*model.Inventory, error)
 	ListInventory(ctx context.Context) ([]model.Inventory, error)
-	AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error
+
+	CreateTrip(ctx context.Context, req model.TripRequest) (*model.Trip, error)
+	UpdateTrip(ctx context.Context, id string, req model.TripRequest) (*model.Trip, error)
+	DeleteTrip(ctx context.Context, id string) error
+	GetTrip(ctx context.Context, id string) (*model.Trip, error)
+	ListTrips(ctx context.Context) ([]model.Trip, error)
+	SeedTrips(ctx context.Context) (int, error)
+
 	FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
 	MarkOutboxEventPublished(ctx context.Context, id string) error
 	MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error
@@ -53,44 +77,97 @@ func (r *postgresRepository) Close() {
 	r.db.Close()
 }
 
-func (r *postgresRepository) ReserveSlot(ctx context.Context, bookingID, resourceID string) (bool, error) {
+// ReserveSlot menahan kursi untuk sebuah booking.
+//
+// Pengurangan stok, pencatatan reservasi, dan event yang menyusul semuanya
+// berada dalam satu transaksi. Kalau kursi tidak cukup, transaksi yang
+// sama menulis inventory.rejected ke outbox -- booking-service memakainya
+// untuk membatalkan booking, sehingga tidak ada lagi booking yang lanjut
+// ke pembayaran padahal kursinya sudah habis.
+func (r *postgresRepository) ReserveSlot(ctx context.Context, event model.BookingCreatedEvent) (ReserveOutcome, error) {
+	bookingID := event.BookingID
+	resourceID := event.ResourceID
+	quantity := event.Seats()
+
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, err
+		return ReserveOutcomeRejected, err
 	}
 	defer tx.Rollback(ctx)
 
 	var existingStatus string
 	err = tx.QueryRow(ctx, `SELECT status FROM inventory_reservations WHERE booking_id = $1`, bookingID).Scan(&existingStatus)
 	if err == nil {
-		return true, tx.Commit(ctx)
+		return ReserveOutcomeDuplicate, tx.Commit(ctx)
 	}
-	if err != nil && err != pgx.ErrNoRows {
-		return false, err
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return ReserveOutcomeRejected, err
 	}
 
 	updateTag, err := tx.Exec(ctx, `
 		UPDATE inventory
-		SET available_slots = available_slots - 1, updated_at = NOW()
-		WHERE resource_id = $1 AND available_slots > 0
-	`, resourceID)
+		SET available_slots = available_slots - $2, updated_at = NOW()
+		WHERE resource_id = $1 AND available_slots >= $2
+	`, resourceID, quantity)
 	if err != nil {
-		return false, err
+		return ReserveOutcomeRejected, err
 	}
+
 	if updateTag.RowsAffected() == 0 {
-		return false, fmt.Errorf("inventory unavailable for resource %s", resourceID)
+		reason := "kursi tidak mencukupi"
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM inventory WHERE resource_id = $1)`, resourceID).Scan(&exists); err != nil {
+			return ReserveOutcomeRejected, err
+		}
+		if !exists {
+			reason = "trip tidak ditemukan"
+		}
+		rejected := model.InventoryRejectedEvent{
+			BookingID:  bookingID,
+			ResourceID: resourceID,
+			Quantity:   quantity,
+			Reason:     reason,
+		}
+		if err := insertOutbox(ctx, tx, "inventory.rejected", bookingID, rejected); err != nil {
+			return ReserveOutcomeRejected, err
+		}
+		return ReserveOutcomeRejected, tx.Commit(ctx)
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO inventory_reservations (booking_id, resource_id, status, created_at, updated_at)
-		VALUES ($1, $2, $3, NOW(), NOW())
-	`, bookingID, resourceID, model.ReservationStatusReserved); err != nil {
-		return false, err
+		INSERT INTO inventory_reservations (booking_id, resource_id, quantity, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, NOW(), NOW())
+	`, bookingID, resourceID, quantity, model.ReservationStatusReserved); err != nil {
+		return ReserveOutcomeRejected, err
 	}
 
-	return true, tx.Commit(ctx)
+	// Sisa kursi berubah, jadi read model harus tahu. Tanpa ini angka
+	// "sisa N kursi" di katalog tidak pernah berkurang.
+	if err := enqueueTripUpserted(ctx, tx, resourceID); err != nil {
+		return ReserveOutcomeRejected, err
+	}
+
+	// Izin menagih terbit dalam transaksi yang sama dengan pengurangan
+	// kursinya. Tidak ada celah di mana kursi sudah berkurang tapi tidak
+	// ada yang tahu, atau sebaliknya.
+	reserved := model.InventoryReservedEvent{
+		BookingID:   bookingID,
+		UserID:      event.UserID,
+		ResourceID:  resourceID,
+		Quantity:    quantity,
+		TotalAmount: event.TotalAmount,
+		ExpiresAt:   event.ExpiresAt,
+	}
+	if err := insertOutbox(ctx, tx, "inventory.reserved", bookingID, reserved); err != nil {
+		return ReserveOutcomeRejected, err
+	}
+
+	return ReserveOutcomeReserved, tx.Commit(ctx)
 }
 
+// ConfirmReservation tidak mengubah sisa kursi: kursinya sudah ditahan
+// sejak RESERVED. Yang berubah hanya sifat tahanannya, dari sementara
+// jadi tetap.
 func (r *postgresRepository) ConfirmReservation(ctx context.Context, bookingID string) (bool, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE inventory_reservations
@@ -103,21 +180,27 @@ func (r *postgresRepository) ConfirmReservation(ctx context.Context, bookingID s
 	return tag.RowsAffected() == 1, nil
 }
 
-func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID string) (bool, error) {
+// ReleaseReservation mengembalikan kursi ke stok.
+//
+// allowConfirmed dipakai untuk pembatalan eksplisit (dan nanti refund).
+// Sebelumnya reservasi CONFIRMED tidak pernah bisa dilepas dengan alasan
+// apa pun, sehingga kursi yang dibatalkan hilang selamanya.
+func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID string, allowConfirmed bool) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback(ctx)
 
-	var resourceID string
-	var status string
+	var resourceID, status string
+	var quantity int
 	err = tx.QueryRow(ctx, `
-		SELECT resource_id, status
+		SELECT resource_id, status, quantity
 		FROM inventory_reservations
 		WHERE booking_id = $1
-	`, bookingID).Scan(&resourceID, &status)
-	if err == pgx.ErrNoRows {
+		FOR UPDATE
+	`, bookingID).Scan(&resourceID, &status, &quantity)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
@@ -127,7 +210,7 @@ func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID s
 	if status == model.ReservationStatusReleased {
 		return false, tx.Commit(ctx)
 	}
-	if status == model.ReservationStatusConfirmed {
+	if status == model.ReservationStatusConfirmed && !allowConfirmed {
 		return false, tx.Commit(ctx)
 	}
 
@@ -139,32 +222,65 @@ func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID s
 		return false, err
 	}
 
+	// LEAST menjaga sisa kursi tidak pernah melewati total, misalnya bila
+	// admin menurunkan kapasitas selagi ada reservasi berjalan.
 	if _, err := tx.Exec(ctx, `
 		UPDATE inventory
-		SET available_slots = available_slots + 1, updated_at = NOW()
+		SET available_slots = LEAST(total_slots, available_slots + $2), updated_at = NOW()
 		WHERE resource_id = $1
-	`, resourceID); err != nil {
+	`, resourceID, quantity); err != nil {
+		return false, err
+	}
+
+	if err := enqueueTripUpserted(ctx, tx, resourceID); err != nil {
 		return false, err
 	}
 
 	return true, tx.Commit(ctx)
 }
 
-func (r *postgresRepository) UpsertInventory(ctx context.Context, req model.UpsertInventoryRequest) error {
-	_, err := r.db.Exec(ctx, `
+// UpdateInventory menyesuaikan kapasitas tanpa menyentuh detail trip.
+// Pembuatan kapasitas baru tidak lagi lewat sini: kapasitas selalu lahir
+// bersama trip-nya di CreateTrip.
+func (r *postgresRepository) UpdateInventory(ctx context.Context, resourceID string, totalSlots int) error {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM trips WHERE id = $1)`, resourceID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrTripNotFound
+	}
+
+	reserved, err := lockAndCountReserved(ctx, tx, resourceID)
+	if err != nil {
+		return err
+	}
+	available := totalSlots - reserved
+	if available < 0 {
+		available = 0
+	}
+
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO inventory (resource_id, total_slots, available_slots, created_at, updated_at)
-		VALUES ($1, $2, $2, NOW(), NOW())
+		VALUES ($1, $2, $3, NOW(), NOW())
 		ON CONFLICT (resource_id) DO UPDATE SET
 			total_slots = EXCLUDED.total_slots,
-			available_slots = GREATEST(0, EXCLUDED.total_slots - (
-				SELECT COUNT(*)
-				FROM inventory_reservations
-				WHERE inventory_reservations.resource_id = EXCLUDED.resource_id
-				AND inventory_reservations.status IN ('RESERVED', 'CONFIRMED')
-			)),
+			available_slots = EXCLUDED.available_slots,
 			updated_at = NOW()
-	`, req.ResourceID, req.TotalSlots)
-	return err
+	`, resourceID, totalSlots, available); err != nil {
+		return err
+	}
+
+	if err := enqueueTripUpserted(ctx, tx, resourceID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (r *postgresRepository) GetInventoryByResourceID(ctx context.Context, resourceID string) (*model.Inventory, error) {
@@ -181,7 +297,7 @@ func (r *postgresRepository) GetInventoryByResourceID(ctx context.Context, resou
 		WHERE i.resource_id = $1
 	`, resourceID).Scan(&inv.ResourceID, &inv.TotalSlots, &inv.AvailableSlots, &inv.ReservedSlots, &inv.CreatedAt, &inv.UpdatedAt)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
@@ -217,19 +333,14 @@ func (r *postgresRepository) ListInventory(ctx context.Context) ([]model.Invento
 	return items, rows.Err()
 }
 
-func (r *postgresRepository) UpdateInventory(ctx context.Context, resourceID string, totalSlots int) error {
-	return r.UpsertInventory(ctx, model.UpsertInventoryRequest{
-		ResourceID: resourceID,
-		TotalSlots: totalSlots,
-	})
-}
-
-func (r *postgresRepository) AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error {
+// insertOutbox selalu dipanggil dengan transaksi yang juga membawa
+// perubahan datanya. Event dan efeknya lolos atau gagal bersama-sama.
+func insertOutbox(ctx context.Context, tx pgx.Tx, topic, key string, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	_, err = r.db.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		INSERT INTO outbox_events (topic, message_key, payload, status, retry_count, created_at, updated_at)
 		VALUES ($1, $2, $3, 'PENDING', 0, NOW(), NOW())
 	`, topic, key, data)

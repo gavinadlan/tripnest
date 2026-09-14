@@ -7,20 +7,19 @@ import (
 )
 
 type Config struct {
-	Port        string
+	Port         string
+	KafkaBrokers []string
 	MongoURI    string
 	RedisAddr   string
-	JWTSecret   string
 	CORSOrigins []string
 }
 
 func Load() *Config {
 	return &Config{
-		Port:      env.GetString("PORT", "8083"),
+		Port:         env.GetString("PORT", "8083"),
+		KafkaBrokers: splitAndTrim(env.GetString("KAFKA_BROKERS", "localhost:9092")),
 		MongoURI:  env.GetString("MONGO_URI", "mongodb://localhost:27017/tripnest_search"),
 		RedisAddr: env.GetString("REDIS_ADDR", "localhost:6379"),
-		// Tanpa default: secret kosong ditolak saat startup.
-		JWTSecret:   env.GetString("JWT_SECRET", ""),
 		CORSOrigins: splitAndTrim(env.GetString("CORS_ORIGINS", "http://localhost:3000")),
 	}
 }

@@ -4,6 +4,9 @@ export interface Trip {
   destination: string;
   price: number;
   date: string;
+  // total_slots adalah kapasitas yang ditetapkan admin; available_slots
+  // adalah sisanya setelah dikurangi reservasi yang sedang berjalan.
+  total_slots: number;
   available_slots: number;
 }
 

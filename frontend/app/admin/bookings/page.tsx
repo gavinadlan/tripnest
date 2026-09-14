@@ -17,7 +17,7 @@ type Booking = {
   expires_at?: string;
 };
 
-const statuses = ['ALL', 'PENDING_PAYMENT', 'CONFIRMED', 'CANCELLED', 'EXPIRED'];
+const statuses = ['ALL', 'PENDING_SEAT', 'PENDING_PAYMENT', 'CONFIRMED', 'CANCELLED', 'EXPIRED'];
 
 export default function AdminBookingsPage() {
   const [bookings, setBookings] = useState<Booking[]>([]);

@@ -1,8 +1,9 @@
 'use client';
 
-type Status = 'PENDING_PAYMENT' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED' | 'FAILED' | string;
+type Status = 'PENDING_SEAT' | 'PENDING_PAYMENT' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED' | 'FAILED' | string;
 
 const statusStyles: Record<string, string> = {
+  PENDING_SEAT: 'bg-sky-50 text-sky-700 border-sky-200',
   PENDING_PAYMENT: 'bg-amber-50 text-amber-700 border-amber-200',
   CONFIRMED: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   CANCELLED: 'bg-rose-50 text-rose-700 border-rose-200',
@@ -12,6 +13,7 @@ const statusStyles: Record<string, string> = {
 
 export default function StatusBadge({ status }: { status: Status }) {
   const labels: Record<string, string> = {
+    PENDING_SEAT: 'Menyiapkan Kursi',
     PENDING_PAYMENT: 'Menunggu Pembayaran',
     CONFIRMED: 'Terkonfirmasi',
     CANCELLED: 'Dibatalkan',

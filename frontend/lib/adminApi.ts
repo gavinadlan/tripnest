@@ -9,5 +9,8 @@ export {
   bookingApi as adminBookingApi,
   paymentApi as adminPaymentApi,
   inventoryApi as adminInventoryApi,
-  searchApi as adminTripApi,
+  // Katalog ditulis ke catalog-service (port 8084), pemilik trip beserta
+  // kapasitasnya. search-service sekarang read model dan tidak menerima
+  // tulisan sama sekali.
+  inventoryApi as adminTripApi,
 } from './api';

@@ -97,16 +97,21 @@ services:
       PORT: 8081
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
-      # Sumber harga resmi sebuah trip. Harga tidak lagi datang dari client.
-      CATALOG_SERVICE_URL: http://search-service:8083
+      # Sumber resmi harga dan sisa kursi. Pemiliknya catalog-service,
+      # bukan read model -- angka yang menentukan booking tidak boleh
+      # diambil dari proyeksi yang bisa tertinggal.
+      CATALOG_SERVICE_URL: http://inventory-service:8084
       BOOKING_EXPIRY_MINUTES: ${BOOKING_EXPIRY_MINUTES:-15}
+      # Batas menunggu jawaban kursi dari catalog-service sebelum booking
+      # yang nyangkut di PENDING_SEAT dibatalkan.
+      BOOKING_SEAT_TIMEOUT_SECONDS: ${BOOKING_SEAT_TIMEOUT_SECONDS:-120}
       BOOKING_EXPIRY_INTERVAL_SECONDS: ${BOOKING_EXPIRY_INTERVAL_SECONDS:-60}
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      search-service:
+      inventory-service:
         condition: service_started
 
   payment-service:
@@ -163,15 +168,19 @@ services:
       - "8083:8083"
     environment:
       PORT: 8083
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET wajib diisi, lihat .env.example}
+      # Tanpa JWT_SECRET: read model hanya punya endpoint baca publik,
+      # jadi tidak ada lagi yang perlu diverifikasi di sini.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       MONGO_URI: mongodb://mongo:27017/tripnest_search
       REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
     depends_on:
       mongo:
         condition: service_started
       redis:
         condition: service_started
+      kafka:
+        condition: service_healthy
 
 volumes:
   tripnest_pgdata:

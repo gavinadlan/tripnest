@@ -60,7 +60,11 @@ func main() {
 	svc := service.NewPaymentService(repo, producer, midtransClient, cfg.Midtrans.ServerKey, cfg.BookingURL, verifier)
 	h := handler.NewHandler(svc, verifier)
 
-	consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "booking.created", paymentConsumerGroup)
+	// Pemicunya inventory.reserved, bukan booking.created: transaksi Snap
+	// hanya boleh dibuat setelah kursinya benar-benar tertahan. Dulu
+	// booking.created langsung memicu pembuatan token, jadi booking yang
+	// kalah balapan kursi pun sempat punya token dan bisa dibayar.
+	consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "inventory.reserved", paymentConsumerGroup)
 	defer consumer.Close()
 
 	mux := http.NewServeMux()
@@ -72,7 +76,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Println("Payment Service Started (Listening for booking.created)")
+	log.Println("Payment Service Started (Listening for inventory.reserved)")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -92,7 +96,7 @@ func main() {
 
 			processed, err := repo.MarkMessageProcessed(ctx, paymentConsumerGroup, msg.Topic, string(msg.Key))
 			if err != nil {
-				log.Printf("Failed to mark booking.created message: %v", err)
+				log.Printf("Failed to mark inventory.reserved message: %v", err)
 				continue
 			}
 			if !processed {
@@ -105,7 +109,7 @@ func main() {
 				continue
 			}
 
-			log.Printf("Received booking event: %v", event.BookingID)
+			log.Printf("Kursi tertahan, menyiapkan pembayaran booking_id=%s", event.BookingID)
 			// Dijalankan sinkron dan error-nya diperiksa. Versi lama
 			// memakai `go svc.ProcessPayment(...)` sehingga kegagalan
 			// pembuatan transaksi Snap hilang tanpa jejak.

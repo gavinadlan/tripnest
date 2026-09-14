@@ -23,6 +23,12 @@ func NewKafkaProducer(brokers []string) *KafkaProducer {
 		writer: &kafka.Writer{
 			Addr:     kafka.TCP(brokers...),
 			Balancer: &kafka.LeastBytes{},
+			// Topik yang belum punya consumer belum tentu sudah ada di
+			// broker. payment.orphaned adalah contohnya: belum ada yang
+			// mendengarkan, dan tanpa ini publikasinya gagal terus dengan
+			// "Unknown Topic Or Partition" -- persis untuk peristiwa yang
+			// paling tidak boleh hilang.
+			AllowAutoTopicCreation: true,
 		},
 	}
 }

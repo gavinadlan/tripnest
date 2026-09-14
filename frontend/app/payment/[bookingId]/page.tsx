@@ -14,6 +14,13 @@ const SNAP_CLIENT_KEY = process.env.NEXT_PUBLIC_MIDTRANS_CLIENT_KEY || '';
 // Dihitung sekali di level modul, bukan lewat setState di dalam effect.
 const CONFIG_ERROR = SNAP_CLIENT_KEY ? '' : 'NEXT_PUBLIC_MIDTRANS_CLIENT_KEY belum diatur';
 
+// Booking lahir sebagai PENDING_SEAT dan baru bisa dibayar setelah
+// catalog-service menahan kursinya. Normalnya beberapa detik; batas di
+// bawah ini sedikit lebih longgar daripada sapuan booking nyangkut di
+// server, supaya halaman tidak menyerah lebih dulu daripada servernya.
+const SEAT_POLL_INTERVAL_MS = 2000;
+const SEAT_POLL_TIMEOUT_MS = 150000;
+
 type SnapResult = { transaction_status?: string };
 type SnapApi = {
   pay: (
@@ -35,6 +42,7 @@ export default function PaymentPage() {
   const [booking, setBooking] = useState<Booking | null>(null);
   const [snapToken, setSnapToken] = useState('');
   const [loading, setLoading] = useState(true);
+  const [waitingSeat, setWaitingSeat] = useState(false);
   const [paying, setPaying] = useState(false);
   const [error, setError] = useState('');
 
@@ -59,47 +67,71 @@ export default function PaymentPage() {
   useEffect(() => {
     if (!bookingId) return;
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = Date.now() + SEAT_POLL_TIMEOUT_MS;
 
-    const load = async () => {
+    const preparePayment = async (data: Booking) => {
+      // GET hanya membaca. Kalau transaksi Snap belum pernah dibuat,
+      // barulah kita memintanya lewat POST -- endpoint GET tidak boleh
+      // punya efek samping.
+      try {
+        const tokenRes = await paymentApi.get('/payments/snap-token', {
+          params: { booking_id: data.id },
+        });
+        if (!cancelled) setSnapToken(tokenRes.data?.snap_token ?? tokenRes.data?.token ?? '');
+      } catch {
+        const initRes = await paymentApi.post('/payments/snap-token', { booking_id: data.id });
+        if (!cancelled) setSnapToken(initRes.data?.snap_token ?? initRes.data?.token ?? '');
+      }
+    };
+
+    const poll = async () => {
       try {
         const bookingRes = await bookingApi.get(`/bookings/${bookingId}`);
         if (cancelled) return;
 
         const data: Booking = bookingRes.data;
         setBooking(data);
+        setLoading(false);
+
+        // Kursi belum tertahan. Belum ada transaksi Snap yang bisa
+        // diminta -- payment-service sendiri baru bergerak setelah
+        // inventory.reserved terbit -- jadi tunggu, jangan bertanya.
+        if (data.status === 'PENDING_SEAT') {
+          if (Date.now() > deadline) {
+            setWaitingSeat(false);
+            setError('Kursi tidak kunjung dipastikan. Coba buka lagi pesananmu sebentar lagi.');
+            return;
+          }
+          setWaitingSeat(true);
+          timer = setTimeout(() => void poll(), SEAT_POLL_INTERVAL_MS);
+          return;
+        }
+
+        setWaitingSeat(false);
 
         if (data.status !== 'PENDING_PAYMENT') {
           setError(`Booking ini berstatus ${data.status} dan tidak bisa dibayar`);
           return;
         }
 
-        // GET hanya membaca. Kalau transaksi Snap belum pernah dibuat,
-        // barulah kita memintanya lewat POST -- endpoint GET tidak boleh
-        // punya efek samping.
-        try {
-          const tokenRes = await paymentApi.get('/payments/snap-token', {
-            params: { booking_id: data.id },
-          });
-          if (!cancelled) setSnapToken(tokenRes.data?.snap_token ?? tokenRes.data?.token ?? '');
-        } catch {
-          const initRes = await paymentApi.post('/payments/snap-token', { booking_id: data.id });
-          if (!cancelled) setSnapToken(initRes.data?.snap_token ?? initRes.data?.token ?? '');
-        }
+        await preparePayment(data);
       } catch (err: unknown) {
         if (cancelled) return;
         const status =
           typeof err === 'object' && err !== null && 'response' in err
             ? (err as { response?: { status?: number } }).response?.status
             : undefined;
+        setWaitingSeat(false);
+        setLoading(false);
         setError(status === 404 ? 'Booking tidak ditemukan' : 'Gagal menyiapkan pembayaran');
-      } finally {
-        if (!cancelled) setLoading(false);
       }
     };
 
-    void load();
+    void poll();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, [bookingId]);
 
@@ -156,12 +188,37 @@ export default function PaymentPage() {
     );
   }
 
-  const canPay = Boolean(snapToken) && !paying;
+  const canPay = Boolean(snapToken) && !paying && !waitingSeat;
+
+  const buttonLabel = paying
+    ? 'Memproses...'
+    : waitingSeat
+      ? 'Menyiapkan kursi...'
+      : !snapToken
+        ? 'Menyiapkan pembayaran...'
+        : 'Bayar sekarang';
 
   return (
     <section className="mx-auto max-w-2xl rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-sm">
       <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">Pembayaran</h1>
       <p className="mt-2 font-mono text-xs text-[var(--color-text-secondary)]">{booking.id}</p>
+
+      {waitingSeat ? (
+        <div className="mt-5 flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-muted)] p-4">
+          <span
+            aria-hidden
+            className="mt-0.5 h-4 w-4 animate-spin rounded-full border-2 border-[var(--color-primary)] border-t-transparent"
+          />
+          <div className="text-sm">
+            <p className="font-medium text-[var(--color-text-primary)]">Menyiapkan kursi...</p>
+            <p className="mt-1 text-[var(--color-text-secondary)]">
+              Kami sedang memastikan kursimu masih tersedia. Pembayaran baru dibuka setelah kursi
+              benar-benar tertahan, jadi kamu tidak akan membayar untuk kursi yang sudah diambil
+              orang lain.
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       <div className="mt-5 space-y-1 text-sm text-[var(--color-text-secondary)]">
         <p>Trip: {booking.resource_id}</p>
@@ -169,7 +226,7 @@ export default function PaymentPage() {
         <p className="text-lg font-semibold text-[var(--color-text-primary)]">
           Total: {formatRupiah(booking.total_amount)}
         </p>
-        {booking.expires_at ? (
+        {booking.expires_at && !waitingSeat ? (
           <p className="text-xs">
             Bayar sebelum {new Date(booking.expires_at).toLocaleString('id-ID')}
           </p>
@@ -181,7 +238,7 @@ export default function PaymentPage() {
         disabled={!canPay}
         className="mt-6 rounded-xl bg-[var(--color-primary)] px-5 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-300"
       >
-        {paying ? 'Memproses...' : !snapToken ? 'Menyiapkan pembayaran...' : 'Bayar sekarang'}
+        {buttonLabel}
       </button>
     </section>
   );

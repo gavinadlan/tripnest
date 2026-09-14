@@ -11,17 +11,20 @@ type Trip = {
   destination: string;
   price: number;
   date: string;
+  total_slots: number;
   available_slots: number;
 };
 
-type TripForm = Omit<Trip, 'id'>;
+// Form admin menetapkan kapasitas (total_slots). Sisa kursi dihitung
+// server dari reservasi yang berjalan, jadi tidak pernah dikirim dari sini.
+type TripForm = Omit<Trip, 'id' | 'available_slots'>;
 
 const initialForm: TripForm = {
   title: '',
   destination: '',
   price: 0,
   date: '',
-  available_slots: 0,
+  total_slots: 0,
 };
 
 export default function AdminTripsPage() {
@@ -70,7 +73,7 @@ export default function AdminTripsPage() {
   };
 
   const submitTrip = async () => {
-    if (!form.title || !form.destination || !form.date || form.price <= 0 || form.available_slots <= 0) {
+    if (!form.title || !form.destination || !form.date || form.price <= 0 || form.total_slots <= 0) {
       toast.error('Lengkapi data. Harga dan slot harus lebih dari 0');
       return;
     }
@@ -132,12 +135,12 @@ export default function AdminTripsPage() {
           </div>
           <div>
             <label className="mb-1 block text-sm font-medium text-[var(--color-text-primary)]">Total Slot</label>
-            <input type="number" min={1} className="w-full rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm" placeholder="Contoh: 20" value={form.available_slots} onChange={(e) => setForm((p) => ({ ...p, available_slots: Number(e.target.value) }))} />
+            <input type="number" min={1} className="w-full rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm" placeholder="Contoh: 20" value={form.total_slots} onChange={(e) => setForm((p) => ({ ...p, total_slots: Number(e.target.value) }))} />
           </div>
           <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-muted)] p-3 text-sm text-[var(--color-text-secondary)]">
             <p className="font-medium text-[var(--color-text-primary)]">Preview</p>
             <p className="mt-1">Harga per kursi: {formatRupiah(form.price)}</p>
-            <p className="mt-1">Total potensi pendapatan: {formatRupiah(form.price * form.available_slots)}</p>
+            <p className="mt-1">Total potensi pendapatan: {formatRupiah(form.price * form.total_slots)}</p>
           </div>
           <div className="flex gap-2 md:col-span-2">
             <button onClick={submitTrip} disabled={loading} className="rounded-lg bg-[var(--color-primary)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
@@ -160,7 +163,7 @@ export default function AdminTripsPage() {
               <th className="px-4 py-3 font-medium">Lokasi</th>
               <th className="px-4 py-3 font-medium">Tanggal</th>
               <th className="px-4 py-3 font-medium">Harga</th>
-              <th className="px-4 py-3 font-medium">Slot</th>
+              <th className="px-4 py-3 font-medium">Sisa / Total Slot</th>
               <th className="px-4 py-3 font-medium">Aksi</th>
             </tr>
           </thead>
@@ -171,7 +174,9 @@ export default function AdminTripsPage() {
                 <td className="px-4 py-3">{trip.destination}</td>
                 <td className="px-4 py-3">{trip.date}</td>
                 <td className="px-4 py-3">{formatRupiah(trip.price)}</td>
-                <td className="px-4 py-3">{trip.available_slots}</td>
+                <td className="px-4 py-3">
+                  {trip.available_slots} / {trip.total_slots}
+                </td>
                 <td className="px-4 py-3">
                   <div className="flex gap-2">
                     <button
@@ -182,7 +187,7 @@ export default function AdminTripsPage() {
                           destination: trip.destination,
                           date: trip.date,
                           price: trip.price,
-                          available_slots: trip.available_slots,
+                          total_slots: trip.total_slots,
                         });
                       }}
                       className="rounded-md border border-[var(--color-border)] px-2 py-1 text-xs"

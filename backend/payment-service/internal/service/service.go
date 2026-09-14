@@ -166,6 +166,14 @@ func (s *paymentService) GetSnapToken(ctx context.Context, caller Caller, bookin
 		return nil, ErrForbidden
 	}
 
+	// Status diperiksa di sini juga, bukan hanya saat token dibuat.
+	// Token yang sudah terbit tetap valid di sisi Midtrans, jadi tanpa
+	// pemeriksaan ini booking yang dibatalkan beberapa detik setelah
+	// dibuat masih bisa dibuka halaman pembayarannya dan dibayar.
+	if err := ensurePayable(booking); err != nil {
+		return nil, err
+	}
+
 	payment, err := s.repo.GetByBookingID(ctx, bookingID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch payment by booking id: %w", err)
@@ -174,6 +182,19 @@ func (s *paymentService) GetSnapToken(ctx context.Context, caller Caller, bookin
 		return nil, ErrPaymentNotReady
 	}
 	return payment, nil
+}
+
+// ensurePayable menolak booking yang sudah kedaluwarsa, dibatalkan, atau
+// sudah lunas. Uang yang masuk untuk booking seperti itu tidak bisa
+// dipakai: ConfirmBooking hanya bertransisi dari PENDING_PAYMENT.
+func ensurePayable(booking *bookingSnapshot) error {
+	if booking.Status != bookingStatusPendingPayment {
+		return fmt.Errorf("%w: status %s", ErrBookingNotPayable, booking.Status)
+	}
+	if !booking.ExpiresAt.IsZero() && time.Now().After(booking.ExpiresAt) {
+		return fmt.Errorf("%w: masa pembayaran sudah lewat", ErrBookingNotPayable)
+	}
+	return nil
 }
 
 func (s *paymentService) InitiatePayment(ctx context.Context, caller Caller, bookingID string) (*model.Payment, error) {
@@ -192,15 +213,8 @@ func (s *paymentService) InitiatePayment(ctx context.Context, caller Caller, boo
 		return nil, ErrForbidden
 	}
 
-	// Tolak booking yang sudah kedaluwarsa, dibatalkan, atau sudah lunas.
-	// Tanpa penjagaan ini user bisa membayar booking EXPIRED: uangnya
-	// masuk, tapi ConfirmBooking hanya bertransisi dari PENDING_PAYMENT
-	// sehingga booking tetap mati dan tidak ada mekanisme refund.
-	if booking.Status != bookingStatusPendingPayment {
-		return nil, fmt.Errorf("%w: status %s", ErrBookingNotPayable, booking.Status)
-	}
-	if !booking.ExpiresAt.IsZero() && time.Now().After(booking.ExpiresAt) {
-		return nil, fmt.Errorf("%w: masa pembayaran sudah lewat", ErrBookingNotPayable)
+	if err := ensurePayable(booking); err != nil {
+		return nil, err
 	}
 
 	if err := s.ProcessPayment(ctx, model.BookingEvent{

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -9,9 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gavinadlan/tripnest/backend/common/auth"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/handler"
+	"github.com/gavinadlan/tripnest/backend/search-service/internal/model"
+	"github.com/gavinadlan/tripnest/backend/search-service/internal/msgbroker"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/repository"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/service"
 	"github.com/go-chi/chi/v5"
@@ -20,14 +22,13 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Satu consumer group untuk kedua topik katalog: keduanya menuju read
+// model yang sama.
+const catalogConsumerGroup = "search-service-group-catalog"
+
 func main() {
 	_ = godotenv.Load()
 	cfg := config.Load()
-
-	verifier, err := auth.NewVerifier(cfg.JWTSecret)
-	if err != nil {
-		log.Fatalf("Konfigurasi auth tidak valid: %v", err)
-	}
 
 	log.Printf("Starting Search Service on port %s", cfg.Port)
 
@@ -57,28 +58,41 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	// Katalog boleh dibaca siapa saja: ini etalase publik.
+	// Read model hanya punya endpoint baca. Menulis katalog dilakukan di
+	// catalog-service; dulu trip bisa dibuat di sini juga, dan trip hasil
+	// jalur itu tidak pernah punya baris kapasitas.
 	r.Get("/search", h.Search)
 	r.Get("/trips", h.ListTrips)
 	r.Get("/trips/{id}", h.GetTrip)
-
-	// Menulis katalog hanya untuk admin. Sebelumnya endpoint ini terbuka,
-	// jadi siapa pun bisa menghapus seluruh trip.
-	r.Group(func(r chi.Router) {
-		r.Use(verifier.Required)
-		r.Use(requireAdmin)
-
-		r.Post("/trips", h.CreateTrip)
-		r.Put("/trips/{id}", h.UpdateTrip)
-		r.Delete("/trips/{id}", h.DeleteTrip)
-		r.Post("/seed", h.Seed)
-	})
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           r,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+
+	upsertedConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "trip.upserted", catalogConsumerGroup)
+	defer upsertedConsumer.Close()
+	go consume(consumerCtx, upsertedConsumer, "trip.upserted", func(ctx context.Context, value []byte) error {
+		var event model.TripUpsertedEvent
+		if err := json.Unmarshal(value, &event); err != nil {
+			return err
+		}
+		return svc.ApplyTripUpserted(ctx, event)
+	})
+
+	deletedConsumer := msgbroker.NewConsumer(cfg.KafkaBrokers, "trip.deleted", catalogConsumerGroup)
+	defer deletedConsumer.Close()
+	go consume(consumerCtx, deletedConsumer, "trip.deleted", func(ctx context.Context, value []byte) error {
+		var event model.TripDeletedEvent
+		if err := json.Unmarshal(value, &event); err != nil {
+			return err
+		}
+		return svc.ApplyTripDeleted(ctx, event)
+	})
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -95,14 +109,27 @@ func main() {
 	_ = server.Shutdown(ctx)
 }
 
-// requireAdmin dipasang setelah verifier.Required, sehingga claims sudah
-// pasti ada di context saat sampai di sini.
-func requireAdmin(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !auth.IsAdmin(r.Context()) {
-			http.Error(w, `{"error":"akses ditolak"}`, http.StatusForbidden)
-			return
+// consume menerapkan event ke read model. Tidak ada tabel
+// processed_messages di sini: upsert dan delete keduanya idempoten, jadi
+// event yang terkirim ulang aman.
+func consume(ctx context.Context, consumer *msgbroker.Consumer, topic string, apply func(context.Context, []byte) error) {
+	log.Printf("Listening for %s events...", topic)
+	for {
+		msg, err := consumer.ReadMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Gangguan Kafka sesaat tidak boleh mematikan consumer sampai
+			// container di-restart.
+			log.Printf("%s consumer error: %v", topic, err)
+			continue
 		}
-		next.ServeHTTP(w, r)
-	})
+
+		if err := apply(ctx, msg.Value); err != nil {
+			log.Printf("failed to apply %s key=%s: %v", topic, string(msg.Key), err)
+			continue
+		}
+		log.Printf("Read model diperbarui dari %s key=%s", topic, string(msg.Key))
+	}
 }

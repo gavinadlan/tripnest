@@ -31,6 +31,8 @@ import (
 const (
 	paymentSuccessConsumerGroup = "booking-service-group-payment-success"
 	paymentFailedConsumerGroup  = "booking-service-group-payment-failed"
+	inventoryRejectedGroup      = "booking-service-group-inventory-rejected"
+	inventoryReservedGroup      = "booking-service-group-inventory-reserved"
 )
 
 func main() {
@@ -54,16 +56,28 @@ func main() {
 	producer := events.NewKafkaProducer(cfg.KafkaBrokers)
 	defer producer.Close()
 
-	catalogClient := catalog.New(cfg.CatalogURL)
+	catalogClient := catalog.New(cfg.CatalogURL, verifier)
 	log.Printf("Sumber harga trip: %s", cfg.CatalogURL)
 
-	svc := service.NewBookingService(repo, catalogClient, cfg.BookingExpiryMinutes)
+	svc := service.NewBookingService(repo, catalogClient, cfg.BookingExpiryMinutes, cfg.SeatTimeoutSeconds)
 
 	paymentSuccessConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.success", paymentSuccessConsumerGroup)
 	defer paymentSuccessConsumer.Close()
 
 	paymentFailedConsumer := events.NewConsumer(cfg.KafkaBrokers, "payment.failed", paymentFailedConsumerGroup)
 	defer paymentFailedConsumer.Close()
+
+	// Penolakan kursi dari catalog-service. Tanpa consumer ini, booking
+	// yang kursinya sudah habis tetap menunggu pembayaran sampai
+	// kedaluwarsa -- kursi yang tidak ada tetap terlihat bisa dibayar.
+	inventoryRejectedConsumer := events.NewConsumer(cfg.KafkaBrokers, "inventory.rejected", inventoryRejectedGroup)
+	defer inventoryRejectedConsumer.Close()
+
+	// Penahanan kursi yang berhasil. Inilah yang memindahkan booking dari
+	// PENDING_SEAT ke PENDING_PAYMENT -- satu-satunya jalan menuju
+	// pembayaran.
+	inventoryReservedConsumer := events.NewConsumer(cfg.KafkaBrokers, "inventory.reserved", inventoryReservedGroup)
+	defer inventoryReservedConsumer.Close()
 
 	h := handler.NewHandler(svc)
 
@@ -105,10 +119,18 @@ func main() {
 	defer cancel()
 
 	go consumePaymentOutcome(ctx, paymentSuccessConsumer, repo, paymentSuccessConsumerGroup, "payment.success", svc.ConfirmBooking)
-	go consumePaymentOutcome(ctx, paymentFailedConsumer, repo, paymentFailedConsumerGroup, "payment.failed", svc.CancelBooking)
+	go consumePaymentOutcome(ctx, paymentFailedConsumer, repo, paymentFailedConsumerGroup, "payment.failed",
+		func(ctx context.Context, event model.PaymentProcessedEvent) error {
+			// Pembatalan tidak butuh detail pembayaran; hanya konfirmasi
+			// yang perlu mencatat nominal saat uangnya jadi yatim.
+			return svc.CancelBooking(ctx, event.BookingID)
+		})
+	go consumeInventoryRejected(ctx, inventoryRejectedConsumer, repo, svc)
+	go consumeInventoryReserved(ctx, inventoryReservedConsumer, repo, svc)
 
 	go runOutboxWorker(ctx, repo, producer)
 	go runExpiryWorker(ctx, svc, cfg.BookingExpiryInterval)
+	go runStuckSeatWorker(ctx, svc)
 
 	go func() {
 		log.Printf("Booking Service starting on port %s", cfg.Port)
@@ -140,7 +162,7 @@ func consumePaymentOutcome(
 	repo repository.BookingRepository,
 	consumerGroup string,
 	topic string,
-	apply func(context.Context, string) error,
+	apply func(context.Context, model.PaymentProcessedEvent) error,
 ) {
 	log.Printf("Listening for %s events...", topic)
 	for {
@@ -169,8 +191,93 @@ func consumePaymentOutcome(
 		}
 
 		log.Printf("Received %s booking_id=%s status=%s", topic, event.BookingID, event.Status)
-		if err := apply(ctx, event.BookingID); err != nil {
+		if err := apply(ctx, event); err != nil {
 			log.Printf("Failed to apply %s for booking %s: %v", topic, event.BookingID, err)
+		}
+	}
+}
+
+// consumeInventoryRejected membatalkan booking yang kursinya ditolak
+// catalog-service. Kursi tidak perlu dilepas balik: reservasinya memang
+// tidak pernah terbentuk, jadi tidak ada booking.cancelled di sini.
+func consumeInventoryRejected(
+	ctx context.Context,
+	consumer *events.Consumer,
+	repo repository.BookingRepository,
+	svc service.BookingService,
+) {
+	log.Println("Listening for inventory.rejected events...")
+	for {
+		msg, err := consumer.ReadMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("inventory.rejected consumer error: %v", err)
+			continue
+		}
+
+		processed, err := repo.MarkMessageProcessed(ctx, inventoryRejectedGroup, msg.Topic, string(msg.Key))
+		if err != nil {
+			log.Printf("Failed to mark message processed: %v", err)
+			continue
+		}
+		if !processed {
+			continue
+		}
+
+		var event model.InventoryRejectedEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			log.Printf("Failed to unmarshal inventory.rejected event: %v", err)
+			continue
+		}
+
+		log.Printf("Kursi ditolak booking_id=%s resource_id=%s reason=%s", event.BookingID, event.ResourceID, event.Reason)
+		if err := svc.CancelUnseatedBooking(ctx, event.BookingID); err != nil {
+			log.Printf("Failed to cancel rejected booking %s: %v", event.BookingID, err)
+		}
+	}
+}
+
+// consumeInventoryReserved membuka jalan menuju pembayaran. Sebelum event
+// ini datang, booking tidak punya kursi dan tidak boleh punya transaksi
+// Snap -- payment-service mendengarkan topik yang sama, bukan
+// booking.created.
+func consumeInventoryReserved(
+	ctx context.Context,
+	consumer *events.Consumer,
+	repo repository.BookingRepository,
+	svc service.BookingService,
+) {
+	log.Println("Listening for inventory.reserved events...")
+	for {
+		msg, err := consumer.ReadMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("inventory.reserved consumer error: %v", err)
+			continue
+		}
+
+		processed, err := repo.MarkMessageProcessed(ctx, inventoryReservedGroup, msg.Topic, string(msg.Key))
+		if err != nil {
+			log.Printf("Failed to mark message processed: %v", err)
+			continue
+		}
+		if !processed {
+			continue
+		}
+
+		var event model.InventoryReservedEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			log.Printf("Failed to unmarshal inventory.reserved event: %v", err)
+			continue
+		}
+
+		log.Printf("Kursi tertahan booking_id=%s resource_id=%s qty=%d", event.BookingID, event.ResourceID, event.Quantity)
+		if err := svc.MarkSeatReserved(ctx, event); err != nil {
+			log.Printf("Failed to mark seat reserved for booking %s: %v", event.BookingID, err)
 		}
 	}
 }
@@ -224,6 +331,27 @@ func runExpiryWorker(ctx context.Context, svc service.BookingService, intervalSe
 		case <-ticker.C:
 			if err := svc.ExpirePendingBookings(ctx); err != nil {
 				log.Printf("Failed to expire pending bookings: %v", err)
+			}
+		}
+	}
+}
+
+// runStuckSeatWorker berjalan jauh lebih sering daripada worker
+// kedaluwarsa: menunggu kursi diukur dalam detik, bukan menit, dan
+// booking yang nyangkut di PENDING_SEAT tidak terlihat oleh worker mana
+// pun kalau tidak ada yang menyapunya.
+func runStuckSeatWorker(ctx context.Context, svc service.BookingService) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("Starting stuck-seat sweeper (interval=30s)")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := svc.ExpireStuckSeatBookings(ctx); err != nil {
+				log.Printf("Failed to sweep stuck seat bookings: %v", err)
 			}
 		}
 	}

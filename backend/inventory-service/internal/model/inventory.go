@@ -30,8 +30,23 @@ type BookingCreatedEvent struct {
 	BookingID   string  `json:"booking_id"`
 	UserID      string  `json:"user_id"`
 	ResourceID  string  `json:"resource_id"`
+	Quantity    int     `json:"quantity"`
 	TotalAmount float64 `json:"total_amount"`
 	ExpiresAt   string  `json:"expires_at"`
+}
+
+// Seats mengembalikan jumlah kursi yang diminta booking. Event lama yang
+// belum punya field quantity berarti satu kursi.
+func (e BookingCreatedEvent) Seats() int {
+	if e.Quantity < 1 {
+		return 1
+	}
+	return e.Quantity
+}
+
+type BookingCancelledEvent struct {
+	BookingID string `json:"booking_id"`
+	Status    string `json:"status"`
 }
 
 type PaymentProcessedEvent struct {
@@ -47,12 +62,9 @@ type BookingExpiredEvent struct {
 	Status    string `json:"status"`
 }
 
-type InventoryStatusEvent struct {
-	BookingID  string `json:"booking_id"`
-	ResourceID string `json:"resource_id"`
-	Status     string `json:"status"`
-}
-
+// UpsertInventoryRequest hanya dipakai endpoint penyesuaian kapasitas.
+// Pembuatan kapasitas baru tidak lagi lewat sini: kapasitas selalu lahir
+// bersama trip-nya dalam satu transaksi.
 type UpsertInventoryRequest struct {
 	ResourceID string `json:"resource_id"`
 	TotalSlots int    `json:"total_slots"`

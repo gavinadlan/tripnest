@@ -68,14 +68,6 @@ func (r *CachedListingRepository) Search(ctx context.Context, params *model.Sear
 	return listings, total, nil
 }
 
-func (r *CachedListingRepository) Seed(ctx context.Context) error {
-	if err := r.next.Seed(ctx); err != nil {
-		return err
-	}
-	r.invalidate(ctx)
-	return nil
-}
-
 func (r *CachedListingRepository) GetByID(ctx context.Context, id string) (*model.Listing, error) {
 	return r.next.GetByID(ctx, id)
 }
@@ -110,16 +102,12 @@ func (r *CachedListingRepository) List(ctx context.Context) ([]*model.Listing, e
 	return r.next.List(ctx)
 }
 
-func (r *CachedListingRepository) Create(ctx context.Context, listing *model.Listing) error {
-	if err := r.next.Create(ctx, listing); err != nil {
-		return err
-	}
-	r.invalidate(ctx)
-	return nil
-}
-
-func (r *CachedListingRepository) Update(ctx context.Context, id string, listing *model.Listing) error {
-	if err := r.next.Update(ctx, id, listing); err != nil {
+// Upsert dan Delete adalah satu-satunya jalan masuk perubahan, dan
+// invalidasi cache menempel di sini. Sebelumnya cache hanya kedaluwarsa
+// lewat TTL, jadi sisa kursi di homepage bisa tertinggal semenit penuh
+// setelah ada yang memesan.
+func (r *CachedListingRepository) Upsert(ctx context.Context, listing *model.Listing) error {
+	if err := r.next.Upsert(ctx, listing); err != nil {
 		return err
 	}
 	r.invalidate(ctx)

@@ -16,6 +16,10 @@ func NewProducer(brokers []string) *Producer {
 		writer: &kafka.Writer{
 			Addr:     kafka.TCP(brokers...),
 			Balancer: &kafka.LeastBytes{},
+			// Topik baru belum tentu sudah ada di broker saat event
+			// pertamanya terbit. Tanpa ini publikasinya gagal terus
+			// dengan "Unknown Topic Or Partition".
+			AllowAutoTopicCreation: true,
 		},
 	}
 }

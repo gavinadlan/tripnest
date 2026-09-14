@@ -160,9 +160,9 @@ func (h *Handler) CancelBooking(w http.ResponseWriter, r *http.Request) {
 	// Admin boleh membatalkan booking siapa pun; user hanya miliknya.
 	var err error
 	if auth.IsAdmin(r.Context()) {
-		err = h.svc.CancelBooking(r.Context(), id)
+		err = h.svc.CancelByAdmin(r.Context(), id)
 	} else {
-		err = h.svc.CancelOwnBooking(r.Context(), userID, id)
+		err = h.svc.CancelByUser(r.Context(), userID, id)
 	}
 	if err != nil {
 		writeServiceError(w, err)

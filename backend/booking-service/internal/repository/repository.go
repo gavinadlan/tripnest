@@ -22,6 +22,9 @@ type BookingRepository interface {
 	UpdateStatusIfCurrent(ctx context.Context, id, currentStatus, nextStatus string) (bool, error)
 	ExpirePendingBookings(ctx context.Context, now time.Time) ([]string, error)
 	AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error
+	// CancelStuckSeatBookings membatalkan booking yang tertinggal di
+	// PENDING_SEAT melewati batas waktu penahanan kursi.
+	CancelStuckSeatBookings(ctx context.Context, cutoff time.Time) ([]string, error)
 	FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
 	MarkOutboxEventPublished(ctx context.Context, id string) error
 	MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error
@@ -70,17 +73,20 @@ func (r *postgresRepository) CreateWithEvent(ctx context.Context, b *model.Booki
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, created_at, updated_at, expires_at`
 
+	// Status datang dari pemanggil, tidak lagi dipaku di sini. Sejak ada
+	// PENDING_SEAT, keadaan awal booking adalah keputusan service --
+	// menimpanya dengan PENDING_PAYMENT di lapisan ini justru melewati
+	// seluruh penjagaan kursi.
 	if err := tx.QueryRow(ctx, insertBooking,
 		b.UserID,
 		b.ResourceID,
 		b.Quantity,
 		b.TotalAmount,
-		model.BookingStatusPendingPayment,
+		b.Status,
 		b.ExpiresAt,
 	).Scan(&b.ID, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt); err != nil {
 		return fmt.Errorf("failed to create booking: %w", err)
 	}
-	b.Status = model.BookingStatusPendingPayment
 
 	// Payload event butuh id booking, yang baru diketahui setelah insert
 	// di atas. Karena keduanya berada dalam transaksi yang sama, event
@@ -222,6 +228,33 @@ func (r *postgresRepository) ExpirePendingBookings(ctx context.Context, now time
 		expiredIDs = append(expiredIDs, id)
 	}
 	return expiredIDs, rows.Err()
+}
+
+// CancelStuckSeatBookings memakai created_at, bukan expires_at: batas
+// waktu menunggu kursi diukur dalam detik, sementara expires_at adalah
+// tenggat pembayaran yang panjangnya belasan menit.
+func (r *postgresRepository) CancelStuckSeatBookings(ctx context.Context, cutoff time.Time) ([]string, error) {
+	query := `
+		UPDATE bookings
+		SET status = $1, updated_at = NOW()
+		WHERE status = $2 AND created_at <= $3
+		RETURNING id
+	`
+	rows, err := r.db.Query(ctx, query, model.BookingStatusCancelled, model.BookingStatusPendingSeat, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	stuckIDs := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		stuckIDs = append(stuckIDs, id)
+	}
+	return stuckIDs, rows.Err()
 }
 
 func (r *postgresRepository) AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error {

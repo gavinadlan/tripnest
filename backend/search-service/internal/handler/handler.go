@@ -5,13 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gavinadlan/tripnest/backend/common/utils"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/model"
 	"github.com/gavinadlan/tripnest/backend/search-service/internal/service"
 	"github.com/go-chi/chi/v5"
-	"go.mongodb.org/mongo-driver/mongo"
 )
 
 type Handler struct {
@@ -63,15 +61,6 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func (h *Handler) Seed(w http.ResponseWriter, r *http.Request) {
-	if err := h.svc.SeedListings(r.Context()); err != nil {
-		http.Error(w, `{"error": "seeding failed"}`, http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message": "seeded successfully"}`))
-}
-
 func (h *Handler) ListTrips(w http.ResponseWriter, r *http.Request) {
 	trips, err := h.svc.ListTrips(r.Context())
 	if err != nil {
@@ -82,8 +71,9 @@ func (h *Handler) ListTrips(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": trips})
 }
 
-// GetTrip mengembalikan satu trip. booking-service memakai endpoint ini
-// untuk mengambil harga resmi, jadi bentuk responsnya harus stabil.
+// GetTrip melayani halaman detail di frontend. booking-service TIDAK
+// memakai endpoint ini lagi: harga resmi diambil dari catalog-service,
+// pemilik datanya, bukan dari read model yang bisa tertinggal.
 func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
@@ -104,89 +94,3 @@ func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request) {
 	_ = utils.WriteJSON(w, http.StatusOK, trip)
 }
 
-func (h *Handler) CreateTrip(w http.ResponseWriter, r *http.Request) {
-	var req model.Listing
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid payload"}`, http.StatusBadRequest)
-		return
-	}
-	if err := validateListing(&req); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
-		return
-	}
-	if err := h.svc.CreateTrip(r.Context(), &req); err != nil {
-		http.Error(w, `{"error":"failed to create trip"}`, http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(req)
-}
-
-func (h *Handler) UpdateTrip(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if id == "" {
-		http.Error(w, `{"error":"missing id"}`, http.StatusBadRequest)
-		return
-	}
-	var req model.Listing
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid payload"}`, http.StatusBadRequest)
-		return
-	}
-	if err := validateListing(&req); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
-		return
-	}
-	if err := h.svc.UpdateTrip(r.Context(), id, &req); err != nil {
-		if errors.Is(err, mongo.ErrNoDocuments) {
-			utils.WriteError(w, http.StatusNotFound, errors.New("trip tidak ditemukan"))
-			return
-		}
-		utils.WriteError(w, http.StatusInternalServerError, err)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (h *Handler) DeleteTrip(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if id == "" {
-		http.Error(w, `{"error":"missing id"}`, http.StatusBadRequest)
-		return
-	}
-	if err := h.svc.DeleteTrip(r.Context(), id); err != nil {
-		if errors.Is(err, mongo.ErrNoDocuments) {
-			utils.WriteError(w, http.StatusNotFound, errors.New("trip tidak ditemukan"))
-			return
-		}
-		utils.WriteError(w, http.StatusInternalServerError, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func validateListing(listing *model.Listing) error {
-	if listing.Title == "" || listing.Destination == "" || listing.Date == "" {
-		return errors.New("title, destination, dan date wajib diisi")
-	}
-	if listing.Price <= 0 {
-		return errors.New("price harus lebih dari 0")
-	}
-	if listing.AvailableSlots < 0 {
-		return errors.New("available_slots tidak boleh negatif")
-	}
-
-	// Tanggal disimpan sebagai string YYYY-MM-DD, jadi formatnya harus
-	// divalidasi di sini -- kalau tidak, filter pencarian per tanggal
-	// diam-diam tidak pernah cocok.
-	parsed, err := time.Parse("2006-01-02", listing.Date)
-	if err != nil {
-		return errors.New("date harus berformat YYYY-MM-DD")
-	}
-	if parsed.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
-		return errors.New("date tidak boleh di masa lalu")
-	}
-	return nil
-}
