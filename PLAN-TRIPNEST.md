@@ -157,37 +157,58 @@ Tiga peran: **Guest**, **User**, **Admin**.
 
 ## 2.3 State machine booking
 
+Diperbarui 14 Sep 2026: ada satu keadaan baru, `PENDING_SEAT`. Booking lahir di sana dan
+baru boleh ditagih setelah catalog-service benar-benar menahan kursinya.
+
 ```
-                    payment.success
-  PENDING_PAYMENT ─────────────────────► CONFIRMED
-        │  │  │                              │
-        │  │  │ payment.failed               │ refund (nanti)
-        │  │  └────────────────────────► CANCELLED ◄──┘
-        │  │
-        │  │ inventory.rejected / user cancel
-        │  └───────────────────────────► CANCELLED
-        │
-        │ expires_at terlewat
-        └──────────────────────────────► EXPIRED
+                     inventory.reserved               payment.success
+  PENDING_SEAT ────────────────────────► PENDING_PAYMENT ────────────────► CONFIRMED
+       │                                     │  │                              │
+       │ inventory.rejected                  │  │ payment.failed               │ user/admin cancel
+       │ (atau tidak ada jawaban dalam       │  │ user/admin cancel            │ (booking.cancelled)
+       │  BOOKING_SEAT_TIMEOUT_SECONDS)      │  └─────────────► CANCELLED ◄────┘
+       └───────────────────────► CANCELLED   │
+                                             │ expires_at terlewat
+                                             └─────────────────► EXPIRED
 ```
 
-Semua transisi wajib lewat compare-and-set seperti `UpdateStatusIfCurrent` yang sudah kamu punya —
-itu bagian yang sudah benar, tinggal dipakai konsisten.
+Yang tetap: semua transisi lewat compare-and-set (`UPDATE ... WHERE status = <yang diharapkan>`),
+sehingga event yang datang terlambat atau dua kali tidak bisa memundurkan booking.
+
+Yang baru:
+
+- **`PENDING_SEAT` → `PENDING_PAYMENT`** hanya lewat `inventory.reserved`. payment-service
+  mendengarkan topik yang sama, jadi tidak ada lagi Snap untuk booking yang kalah balapan kursi.
+- **`PENDING_SEAT` → `CANCELLED`** lewat `inventory.rejected`, atau lewat sapuan
+  `ExpireStuckSeatBookings` bila catalog-service tidak pernah menjawab. Tidak ada
+  `booking.cancelled` di jalur ini karena kursinya memang tidak pernah tertahan.
+- **`CONFIRMED` → `CANCELLED`** (pembatalan eksplisit) menerbitkan `booking.cancelled`,
+  dan catalog-service melepas kursinya walau reservasinya sudah `CONFIRMED` (menutup B24).
+- `payment.success` untuk booking yang sudah bukan `PENDING_PAYMENT` tidak lagi no-op diam:
+  booking-service menerbitkan `payment.orphaned` supaya uangnya terlihat.
 
 ## 2.4 Katalog event (target)
 
+Diperbarui 14 Sep 2026 agar cocok dengan kode. `inventory.reserved` yang semula mau dihapus
+(B23) justru jadi pemicu pembayaran; `booking.cancelled` dan `payment.orphaned` baru.
+
 | Topic | Producer | Consumer | Kegunaan |
 |---|---|---|---|
-| `trip.upserted` | catalog | search | Bangun read model Mongo — **baru** |
-| `trip.deleted` | catalog | search | Hapus dari read model — **baru** |
-| `booking.created` | booking | payment, catalog | Mulai pembayaran, tahan slot |
-| `inventory.rejected` | catalog | booking | Slot habis → batalkan booking — **baru**, menutup B17 |
-| `payment.success` | payment | booking, catalog, notification | Konfirmasi booking + slot |
-| `payment.failed` | payment | booking, catalog | Batalkan booking, lepas slot |
-| `booking.expired` | booking | catalog, payment, notification | Lepas slot, kedaluwarsakan Snap |
-| `booking.confirmed` | booking | notification | Kirim e-ticket — **baru** |
+| `trip.upserted` | catalog | search | Bangun read model Mongo |
+| `trip.deleted` | catalog | search | Hapus dari read model |
+| `booking.created` | booking | catalog | Minta kursi ditahan |
+| `inventory.reserved` | catalog | booking, payment | Kursi tertahan: booking → `PENDING_PAYMENT`, payment membuat Snap |
+| `inventory.rejected` | catalog | booking | Kursi habis → batalkan booking (menutup B17) |
+| `payment.success` | payment | booking, catalog, *notification* | Konfirmasi booking, reservasi jadi permanen |
+| `payment.failed` | payment | booking, catalog | Batalkan booking, lepas kursi |
+| `booking.expired` | booking | catalog, *notification* | Tenggat bayar lewat: lepas kursi |
+| `booking.cancelled` | booking | catalog | Pembatalan eksplisit user/admin: lepas kursi, termasuk yang sudah `CONFIRMED` |
+| `payment.orphaned` | booking | *(belum ada)* | Uang masuk untuk booking yang sudah mati; bahan refund (Sprint 6) |
+| `booking.confirmed` | booking | *notification* | Kirim e-ticket — **belum ada**, dibuat di Sprint 5 |
 
-`inventory.reserved` (B23) dihapus — tidak ada yang butuh.
+Consumer yang dicetak miring belum ada. Semua consumer yang ada memakai `common/inbox`:
+handler → `processed_messages` → commit → commit offset, at-least-once. Semua producer
+menulis lewat `common/outbox` dengan `FOR UPDATE SKIP LOCKED`, backoff, dan dead letter.
 
 ## 2.5 Flow teknis: booking sampai konfirmasi
 
@@ -306,6 +327,30 @@ Ini bagian "flow belum jelas". Lihat Bagian 2.1.
 
 **DoD:** matikan Kafka 30 detik saat ada booking berjalan → nyalakan lagi → semua booking sampai ke status akhir yang benar tanpa restart container. Bayar booking yang sudah kedaluwarsa → Snap menolak.
 
+## Sprint 3.5 — Benahi frontend (3–4 hari)
+
+Ditambahkan 14 Sep 2026. Masalahnya bukan selera — empat temuan konkret,
+tiga di antaranya mekanis.
+
+| # | Temuan | Bukti |
+| :-- | :--- | :--- |
+| F1 | **Font Inter tidak pernah dimuat** | `globals.css` menulis `font-family: Inter`, tapi tidak ada `next/font` maupun link Google Fonts di mana pun. Seluruh aplikasi dirender pakai font sistem, padahal spasi dan ketebalannya dirancang untuk Inter. Ini penyebab paling langsung dari kesan kaku. |
+| F2 | **Tidak ada komponen bersama** | Tombol primer ditulis ulang 7 cara: `rounded-xl` vs `rounded-lg`, `px-5 py-2.5` vs `px-4 py-2` vs `px-4 py-2.5`, dan 3 versi disabled (`bg-slate-300`, `opacity-60`, `opacity-50`). Tidak ada `Button`, `Card`, `Input`. |
+| F3 | **Dua bahasa visual** | `login` dan `register`: 0 token desain, 28–31 kelas Tailwind hardcoded (indigo, gradient, `rounded-3xl`). Semua halaman lain: `var(--color-*)`, kartu datar. |
+| F4 | **Token cuma warna** | 10 variabel, semuanya warna. Tidak ada skala spasi, radius, tipografi, atau shadow. Dark mode nol. Breakpoint responsif cuma di 10 dari ~30 file. |
+
+Urutan kerja:
+
+38. **Muat Inter** lewat `next/font/google` (F1). Kerjakan paling awal: satu perubahan, efeknya paling terasa, dan sisanya jadi dinilai di atas tipografi yang benar.
+39. **Lengkapi token** di `globals.css`: skala spasi, radius, shadow, ukuran dan tinggi baris teks (F4). Didefinisikan sekali, dipakai di mana-mana.
+40. **Primitif di `components/ui/`**: `Button` (varian primary/secondary/ghost/danger, ukuran, state loading dan disabled), `Card`, `Input`, `Field` (label + error + hint), `Badge`. Ganti semua penulisan manual (F2).
+41. **Satukan login dan register** ke bahasa token (F3). Pertahankan kehangatan gaya login — shadow lembut, radius besar — tapi lewat token, bukan hardcoded.
+42. **Empty state dan loading state yang layak** di `/`, `/my-bookings`, dan daftar admin. Bukan cuma teks "Memuat...".
+43. **Dark mode** lewat `prefers-color-scheme`, memakai token dari langkah 39.
+44. **Audit responsif di lebar 375px** untuk seluruh alur booking.
+
+**DoD:** `grep -rc "bg-\[var(--color-primary)\]" app/` di luar `components/ui/` bernilai 0 — tidak ada lagi tombol yang ditulis manual. Alur cari → booking → bayar → status enak dipakai di 375px, mode terang maupun gelap.
+
 ## Sprint 4 — Bukti bahwa semuanya benar (3–4 hari)
 
 Untuk portofolio, ini yang membedakan "proyek yang kelihatan bagus" dari "proyek yang bisa dipertanggungjawabkan".
@@ -353,6 +398,7 @@ Untuk target portofolio, ini menghabiskan waktu tanpa menambah nilai yang seband
 | 1 | Auth + harga server-side | 3–4 hari |
 | 2 | Satukan katalog & kapasitas | 4–5 hari |
 | 3 | Benarkan mesin event | 3–4 hari |
+| 3.5 | Benahi frontend | 3–4 hari |
 | 4 | Test + CI | 3–4 hari |
 | 5 | notification-service | 2–3 hari |
 | 6 | Pilih satu | 2–3 hari |

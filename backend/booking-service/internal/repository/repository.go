@@ -2,11 +2,12 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/model"
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -25,48 +26,36 @@ type BookingRepository interface {
 	// CancelStuckSeatBookings membatalkan booking yang tertinggal di
 	// PENDING_SEAT melewati batas waktu penahanan kursi.
 	CancelStuckSeatBookings(ctx context.Context, cutoff time.Time) ([]string, error)
-	FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
-	MarkOutboxEventPublished(ctx context.Context, id string) error
-	MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error
-	MarkMessageProcessed(ctx context.Context, consumerGroup, topic, messageKey string) (bool, error)
-	Close()
+	// Transact menjalankan fn dalam satu transaksi. Semua method di atas
+	// yang dipanggil dengan ctx milik fn ikut di dalamnya.
+	Transact(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
 type postgresRepository struct {
 	db *pgxpool.Pool
 }
 
-type OutboxEvent struct {
-	ID      string
-	Topic   string
-	Key     string
-	Payload json.RawMessage
+func NewPostgresRepository(pool *pgxpool.Pool) BookingRepository {
+	return &postgresRepository{db: pool}
 }
 
-func NewPostgresRepository(connString string) (BookingRepository, error) {
-	config, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse database config: %v", err)
-	}
-
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		return nil, fmt.Errorf("unable to connect to database: %v", err)
-	}
-
-	return &postgresRepository{db: pool}, nil
+func (r *postgresRepository) Transact(ctx context.Context, fn func(ctx context.Context) error) error {
+	return pgtx.Transact(ctx, r.db, fn)
 }
 
-func (r *postgresRepository) Close() {
-	r.db.Close()
+// q mengembalikan transaksi yang dibawa ctx, atau pool bila tidak ada.
+func (r *postgresRepository) q(ctx context.Context) pgtx.Querier {
+	return pgtx.From(ctx, r.db)
 }
 
 func (r *postgresRepository) CreateWithEvent(ctx context.Context, b *model.Booking, topic string, payload interface{}) error {
-	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to start tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
+	return r.Transact(ctx, func(ctx context.Context) error {
+		return r.createWithEvent(ctx, b, topic, payload)
+	})
+}
+
+func (r *postgresRepository) createWithEvent(ctx context.Context, b *model.Booking, topic string, payload interface{}) error {
+	tx := r.q(ctx)
 
 	insertBooking := `
 		INSERT INTO bookings (user_id, resource_id, quantity, total_amount, status, expires_at)
@@ -95,19 +84,7 @@ func (r *postgresRepository) CreateWithEvent(ctx context.Context, b *model.Booki
 		setter.SetBookingID(b.ID)
 	}
 
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to encode outbox payload: %w", err)
-	}
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO outbox_events (topic, message_key, payload, status, retry_count, created_at, updated_at)
-		VALUES ($1, $2, $3, 'PENDING', 0, NOW(), NOW())
-	`, topic, b.ID, data); err != nil {
-		return fmt.Errorf("failed to enqueue outbox event: %w", err)
-	}
-
-	return tx.Commit(ctx)
+	return outbox.Enqueue(ctx, tx, topic, b.ID, payload)
 }
 
 func (r *postgresRepository) GetByID(ctx context.Context, id string) (*model.Booking, error) {
@@ -117,7 +94,7 @@ func (r *postgresRepository) GetByID(ctx context.Context, id string) (*model.Boo
 		WHERE id = $1
 	`
 	var booking model.Booking
-	err := r.db.QueryRow(ctx, query, id).Scan(
+	err := r.q(ctx).QueryRow(ctx, query, id).Scan(
 		&booking.ID,
 		&booking.UserID,
 		&booking.ResourceID,
@@ -166,7 +143,7 @@ func (r *postgresRepository) List(ctx context.Context, filter ListFilter) ([]mod
 		ORDER BY created_at DESC
 		LIMIT $4 OFFSET $5
 	`
-	rows, err := r.db.Query(ctx, query, filter.UserID, filter.Status, filter.CreatedDate, filter.Limit, filter.Offset)
+	rows, err := r.q(ctx).Query(ctx, query, filter.UserID, filter.Status, filter.CreatedDate, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +176,7 @@ func (r *postgresRepository) UpdateStatusIfCurrent(ctx context.Context, id, curr
 		SET status = $1, updated_at = NOW()
 		WHERE id = $2 AND status = $3
 	`
-	tag, err := r.db.Exec(ctx, query, nextStatus, id, currentStatus)
+	tag, err := r.q(ctx).Exec(ctx, query, nextStatus, id, currentStatus)
 	if err != nil {
 		return false, err
 	}
@@ -213,7 +190,7 @@ func (r *postgresRepository) ExpirePendingBookings(ctx context.Context, now time
 		WHERE status = $2 AND expires_at <= $3
 		RETURNING id
 	`
-	rows, err := r.db.Query(ctx, query, model.BookingStatusExpired, model.BookingStatusPendingPayment, now)
+	rows, err := r.q(ctx).Query(ctx, query, model.BookingStatusExpired, model.BookingStatusPendingPayment, now)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +217,7 @@ func (r *postgresRepository) CancelStuckSeatBookings(ctx context.Context, cutoff
 		WHERE status = $2 AND created_at <= $3
 		RETURNING id
 	`
-	rows, err := r.db.Query(ctx, query, model.BookingStatusCancelled, model.BookingStatusPendingSeat, cutoff)
+	rows, err := r.q(ctx).Query(ctx, query, model.BookingStatusCancelled, model.BookingStatusPendingSeat, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -258,67 +235,5 @@ func (r *postgresRepository) CancelStuckSeatBookings(ctx context.Context, cutoff
 }
 
 func (r *postgresRepository) AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	_, err = r.db.Exec(ctx, `
-		INSERT INTO outbox_events (topic, message_key, payload, status, retry_count, created_at, updated_at)
-		VALUES ($1, $2, $3, 'PENDING', 0, NOW(), NOW())
-	`, topic, key, data)
-	return err
-}
-
-func (r *postgresRepository) FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	rows, err := r.db.Query(ctx, `
-		SELECT id, topic, message_key, payload
-		FROM outbox_events
-		WHERE status = 'PENDING'
-		ORDER BY created_at ASC
-		LIMIT $1
-	`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	events := make([]OutboxEvent, 0)
-	for rows.Next() {
-		var evt OutboxEvent
-		if err := rows.Scan(&evt.ID, &evt.Topic, &evt.Key, &evt.Payload); err != nil {
-			return nil, err
-		}
-		events = append(events, evt)
-	}
-	return events, rows.Err()
-}
-
-func (r *postgresRepository) MarkOutboxEventPublished(ctx context.Context, id string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET status = 'PUBLISHED', published_at = NOW(), updated_at = NOW()
-		WHERE id = $1
-	`, id)
-	return err
-}
-
-func (r *postgresRepository) MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET retry_count = retry_count + 1, last_error = $2, updated_at = NOW()
-		WHERE id = $1
-	`, id, errMsg)
-	return err
-}
-
-func (r *postgresRepository) MarkMessageProcessed(ctx context.Context, consumerGroup, topic, messageKey string) (bool, error) {
-	tag, err := r.db.Exec(ctx, `
-		INSERT INTO processed_messages (consumer_group, topic, message_key, created_at)
-		VALUES ($1, $2, $3, NOW())
-		ON CONFLICT (consumer_group, topic, message_key) DO NOTHING
-	`, consumerGroup, topic, messageKey)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() == 1, nil
+	return outbox.Enqueue(ctx, r.q(ctx), topic, key, payload)
 }

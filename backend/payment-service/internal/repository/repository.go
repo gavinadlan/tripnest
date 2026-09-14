@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -20,38 +22,26 @@ type PaymentRepository interface {
 	MarkWebhookProcessed(ctx context.Context, key string) (bool, error)
 	ApplyWebhookResult(ctx context.Context, notification model.MidtransNotification, status string) (*model.Payment, error)
 	AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error
-	FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
-	MarkOutboxEventPublished(ctx context.Context, id string) error
-	MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error
-	MarkMessageProcessed(ctx context.Context, consumerGroup, topic, messageKey string) (bool, error)
-	Close()
+	// Transact menjalankan fn dalam satu transaksi. Semua method di atas
+	// yang dipanggil dengan ctx milik fn ikut di dalamnya.
+	Transact(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
 type postgresRepository struct {
 	db *pgxpool.Pool
 }
 
-type OutboxEvent struct {
-	ID      string
-	Topic   string
-	Key     string
-	Payload json.RawMessage
+func NewPostgresRepository(pool *pgxpool.Pool) PaymentRepository {
+	return &postgresRepository{db: pool}
 }
 
-func NewPostgresRepository(connString string) (PaymentRepository, error) {
-	config, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		return nil, err
-	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		return nil, err
-	}
-	return &postgresRepository{db: pool}, nil
+func (r *postgresRepository) Transact(ctx context.Context, fn func(ctx context.Context) error) error {
+	return pgtx.Transact(ctx, r.db, fn)
 }
 
-func (r *postgresRepository) Close() {
-	r.db.Close()
+// q mengembalikan transaksi yang dibawa ctx, atau pool bila tidak ada.
+func (r *postgresRepository) q(ctx context.Context) pgtx.Querier {
+	return pgtx.From(ctx, r.db)
 }
 
 func (r *postgresRepository) UpsertInitiated(ctx context.Context, p *model.Payment) error {
@@ -69,7 +59,7 @@ func (r *postgresRepository) UpsertInitiated(ctx context.Context, p *model.Payme
         RETURNING id
     `
 	p.CreatedAt = time.Now()
-	err := r.db.QueryRow(
+	err := r.q(ctx).QueryRow(
 		ctx,
 		query,
 		p.BookingID,
@@ -109,7 +99,7 @@ func (r *postgresRepository) GetByBookingID(ctx context.Context, bookingID strin
 }
 
 func (r *postgresRepository) List(ctx context.Context, status string) ([]model.Payment, error) {
-	rows, err := r.db.Query(ctx, `
+	rows, err := r.q(ctx).Query(ctx, `
 		SELECT
 			id::text,
 			booking_id::text,
@@ -193,7 +183,7 @@ func (r *postgresRepository) MarkWebhookProcessed(ctx context.Context, key strin
 		VALUES ($1, NOW())
 		ON CONFLICT (message_key) DO NOTHING
 	`
-	tag, err := r.db.Exec(ctx, query, key)
+	tag, err := r.q(ctx).Exec(ctx, query, key)
 	if err != nil {
 		return false, fmt.Errorf("failed to mark webhook processed: %w", err)
 	}
@@ -205,13 +195,11 @@ func (r *postgresRepository) MarkWebhookProcessed(ctx context.Context, key strin
 // dengan mencocokkan teks error.
 var ErrPaymentNotFound = errors.New("payment tidak ditemukan")
 
+// ApplyWebhookResult tidak lagi membuka transaksinya sendiri: service
+// membungkusnya bersama insert outbox dan catatan processed_webhooks
+// dalam satu Transact, sehingga tidak ada lagi celah "payment terupdate
+// tapi event-nya belum tertulis".
 func (r *postgresRepository) ApplyWebhookResult(ctx context.Context, notification model.MidtransNotification, status string) (*model.Payment, error) {
-	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to start tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	rawPayload, err := json.Marshal(notification)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode webhook payload: %w", err)
@@ -246,7 +234,7 @@ func (r *postgresRepository) ApplyWebhookResult(ctx context.Context, notificatio
 			updated_at
 	`
 	var p model.Payment
-	if err := tx.QueryRow(
+	if err := r.q(ctx).QueryRow(
 		ctx,
 		updateQuery,
 		status,
@@ -279,16 +267,12 @@ func (r *postgresRepository) ApplyWebhookResult(ctx context.Context, notificatio
 		return nil, fmt.Errorf("failed to update payment from webhook: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit tx: %w", err)
-	}
-
 	return &p, nil
 }
 
 func (r *postgresRepository) getByQuery(ctx context.Context, query string, arg string) (*model.Payment, error) {
 	var p model.Payment
-	err := r.db.QueryRow(ctx, query, arg).Scan(
+	err := r.q(ctx).QueryRow(ctx, query, arg).Scan(
 		&p.ID,
 		&p.BookingID,
 		&p.Amount,
@@ -312,67 +296,5 @@ func (r *postgresRepository) getByQuery(ctx context.Context, query string, arg s
 }
 
 func (r *postgresRepository) AddOutboxEvent(ctx context.Context, topic, key string, payload interface{}) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	_, err = r.db.Exec(ctx, `
-		INSERT INTO outbox_events (topic, message_key, payload, status, retry_count, created_at, updated_at)
-		VALUES ($1, $2, $3, 'PENDING', 0, NOW(), NOW())
-	`, topic, key, data)
-	return err
-}
-
-func (r *postgresRepository) FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	rows, err := r.db.Query(ctx, `
-		SELECT id, topic, message_key, payload
-		FROM outbox_events
-		WHERE status = 'PENDING'
-		ORDER BY created_at ASC
-		LIMIT $1
-	`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	events := make([]OutboxEvent, 0)
-	for rows.Next() {
-		var evt OutboxEvent
-		if err := rows.Scan(&evt.ID, &evt.Topic, &evt.Key, &evt.Payload); err != nil {
-			return nil, err
-		}
-		events = append(events, evt)
-	}
-	return events, rows.Err()
-}
-
-func (r *postgresRepository) MarkOutboxEventPublished(ctx context.Context, id string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET status = 'PUBLISHED', published_at = NOW(), updated_at = NOW()
-		WHERE id = $1
-	`, id)
-	return err
-}
-
-func (r *postgresRepository) MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET retry_count = retry_count + 1, last_error = $2, updated_at = NOW()
-		WHERE id = $1
-	`, id, errMsg)
-	return err
-}
-
-func (r *postgresRepository) MarkMessageProcessed(ctx context.Context, consumerGroup, topic, messageKey string) (bool, error) {
-	tag, err := r.db.Exec(ctx, `
-		INSERT INTO processed_messages (consumer_group, topic, message_key, created_at)
-		VALUES ($1, $2, $3, NOW())
-		ON CONFLICT (consumer_group, topic, message_key) DO NOTHING
-	`, consumerGroup, topic, messageKey)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() == 1, nil
+	return outbox.Enqueue(ctx, r.q(ctx), topic, key, payload)
 }

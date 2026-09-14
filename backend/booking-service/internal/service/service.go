@@ -242,26 +242,26 @@ func (s *bookingService) cancelExplicit(ctx context.Context, booking *model.Book
 		return ErrNotCancellable
 	}
 
-	updated, err := s.repo.UpdateStatusIfCurrent(ctx, booking.ID, booking.Status, model.BookingStatusCancelled)
-	if err != nil {
-		return err
-	}
-	if !updated {
-		// Status berubah di antara pembacaan dan penulisan -- misalnya
-		// booking keburu kedaluwarsa. Perlakukan sebagai tidak bisa dibatalkan.
-		return ErrNotCancellable
-	}
+	// Perubahan status dan event pelepasan kursinya satu transaksi. Dulu
+	// outbox ditulis setelahnya dan kegagalannya cuma di-log -- booking
+	// bisa CANCELLED tanpa kursinya pernah kembali beredar.
+	return s.repo.Transact(ctx, func(ctx context.Context) error {
+		updated, err := s.repo.UpdateStatusIfCurrent(ctx, booking.ID, booking.Status, model.BookingStatusCancelled)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			// Status berubah di antara pembacaan dan penulisan -- misalnya
+			// booking keburu kedaluwarsa. Perlakukan sebagai tidak bisa dibatalkan.
+			return ErrNotCancellable
+		}
 
-	cancelledEvent := model.BookingCancelledEvent{
-		BookingID: booking.ID,
-		Status:    model.BookingStatusCancelled,
-	}
-	if err := s.repo.AddOutboxEvent(ctx, "booking.cancelled", booking.ID, cancelledEvent); err != nil {
-		// Statusnya sudah berubah; kegagalan di sini hanya menunda
-		// kembalinya kursi, jadi jangan gagalkan permintaan user.
-		log.Printf("Failed to enqueue booking.cancelled for %s: %v", booking.ID, err)
-	}
-	return nil
+		cancelledEvent := model.BookingCancelledEvent{
+			BookingID: booking.ID,
+			Status:    model.BookingStatusCancelled,
+		}
+		return s.repo.AddOutboxEvent(ctx, "booking.cancelled", booking.ID, cancelledEvent)
+	})
 }
 
 // MarkSeatReserved adalah satu-satunya pintu menuju PENDING_PAYMENT.
@@ -339,24 +339,28 @@ func (s *bookingService) ExpireStuckSeatBookings(ctx context.Context) error {
 	return nil
 }
 
+// ExpirePendingBookings memindahkan booking yang lewat tenggat ke EXPIRED
+// dan menerbitkan booking.expired untuk masing-masing, dalam satu
+// transaksi: kalau satu event gagal ditulis, tidak ada booking yang
+// berubah status tanpa kursinya dilepas.
 func (s *bookingService) ExpirePendingBookings(ctx context.Context) error {
-	expiredIDs, err := s.repo.ExpirePendingBookings(ctx, time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	for _, bookingID := range expiredIDs {
-		log.Printf("Expired booking %s", bookingID)
-		expiredEvent := model.BookingExpiredEvent{
-			BookingID: bookingID,
-			Status:    model.BookingStatusExpired,
+	return s.repo.Transact(ctx, func(ctx context.Context) error {
+		expiredIDs, err := s.repo.ExpirePendingBookings(ctx, time.Now().UTC())
+		if err != nil {
+			return err
 		}
-		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := s.repo.AddOutboxEvent(publishCtx, "booking.expired", bookingID, expiredEvent); err != nil {
-			log.Printf("Failed to enqueue booking.expired for %s: %v", bookingID, err)
+		for _, bookingID := range expiredIDs {
+			log.Printf("Expired booking %s", bookingID)
+			expiredEvent := model.BookingExpiredEvent{
+				BookingID: bookingID,
+				Status:    model.BookingStatusExpired,
+			}
+			if err := s.repo.AddOutboxEvent(ctx, "booking.expired", bookingID, expiredEvent); err != nil {
+				return fmt.Errorf("gagal menulis booking.expired untuk %s: %w", bookingID, err)
+			}
 		}
-		cancel()
-	}
-	return nil
+		return nil
+	})
 }
 
 // roundCurrency membulatkan ke 2 desimal supaya nilai yang disimpan cocok

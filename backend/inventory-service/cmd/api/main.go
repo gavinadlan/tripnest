@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -13,6 +15,9 @@ import (
 	"time"
 
 	"github.com/gavinadlan/tripnest/backend/common/auth"
+	"github.com/gavinadlan/tripnest/backend/common/inbox"
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/db"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/handler"
@@ -21,6 +26,7 @@ import (
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/repository"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/service"
 	"github.com/joho/godotenv"
+	"github.com/segmentio/kafka-go"
 )
 
 const catalogConsumerGroup = "inventory-service-group"
@@ -37,11 +43,12 @@ func main() {
 
 	db.RunMigrations(cfg.DatabaseURL)
 
-	repo, err := repository.NewPostgresRepository(cfg.DatabaseURL)
+	pool, err := pgtx.NewPool(context.Background(), cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
 	}
-	defer repo.Close()
+	defer pool.Close()
+	repo := repository.NewPostgresRepository(pool)
 
 	producer := msgbroker.NewProducer(cfg.KafkaBrokers)
 	defer producer.Close()
@@ -60,9 +67,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Keempat consumer memakai alur yang sama: baca, tandai sudah
-	// diproses, decode, jalankan. Sebelumnya blok ini disalin empat kali
-	// di file yang sama.
+	// Semua consumer memakai inbox.Consume: handler jalan di dalam
+	// transaksi, processed_messages ditulis setelahnya dalam transaksi
+	// yang sama, offset Kafka di-commit paling akhir.
 	subscriptions := []subscription{
 		{
 			topic: "booking.created",
@@ -122,10 +129,11 @@ func main() {
 	for _, sub := range subscriptions {
 		consumer := msgbroker.NewConsumer(cfg.KafkaBrokers, sub.topic, catalogConsumerGroup)
 		defer consumer.Close()
-		go consume(ctx, consumer, repo, sub)
+		log.Printf("Listening for %s events...", sub.topic)
+		go inbox.Consume(ctx, consumer, pool, catalogConsumerGroup, sub.handler())
 	}
 
-	go runOutboxWorker(ctx, repo, producer)
+	go outbox.NewWorker(pool, producer, outbox.ConfigFromEnv()).Run(ctx)
 
 	go func() {
 		log.Printf("Catalog service API running on port %s", cfg.Port)
@@ -150,65 +158,20 @@ type subscription struct {
 	apply func(ctx context.Context, value []byte) error
 }
 
-func consume(ctx context.Context, consumer *msgbroker.Consumer, repo repository.InventoryRepository, sub subscription) {
-	log.Printf("Listening for %s events...", sub.topic)
-	for {
-		msg, err := consumer.ReadMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+// handler mengubah apply menjadi inbox.Handler. Payload yang tidak bisa
+// di-decode dilaporkan sebagai kegagalan permanen supaya tidak menyumbat
+// partisi; error lain diulang oleh inbox.
+func (s subscription) handler() inbox.Handler {
+	return func(ctx context.Context, msg kafka.Message) error {
+		if err := s.apply(ctx, msg.Value); err != nil {
+			var syntaxErr *json.SyntaxError
+			var typeErr *json.UnmarshalTypeError
+			if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+				return inbox.Permanent(fmt.Errorf("payload %s rusak: %w", s.topic, err))
 			}
-			// Jangan berhenti: gangguan Kafka sesaat tidak boleh mematikan
-			// consumer sampai container di-restart.
-			log.Printf("%s consumer error: %v", sub.topic, err)
-			continue
+			return err
 		}
-
-		processed, err := repo.MarkMessageProcessed(ctx, catalogConsumerGroup, msg.Topic, string(msg.Key))
-		if err != nil {
-			log.Printf("failed to mark %s message: %v", sub.topic, err)
-			continue
-		}
-		if !processed {
-			continue
-		}
-
-		if err := sub.apply(ctx, msg.Value); err != nil {
-			log.Printf("failed to apply %s key=%s: %v", sub.topic, string(msg.Key), err)
-		}
-	}
-}
-
-func runOutboxWorker(ctx context.Context, repo repository.InventoryRepository, producer *msgbroker.Producer) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			outboxEvents, err := repo.FetchPendingOutboxEvents(ctx, 50)
-			if err != nil {
-				log.Printf("Failed to fetch outbox events: %v", err)
-				continue
-			}
-			for _, outboxEvent := range outboxEvents {
-				var payload map[string]interface{}
-				if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
-					_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-					continue
-				}
-				if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
-					_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-					continue
-				}
-				if err := repo.MarkOutboxEventPublished(ctx, outboxEvent.ID); err != nil {
-					log.Printf("failed to mark outbox published: %v", err)
-					continue
-				}
-				log.Printf("Published outbox event topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
-			}
-		}
+		return nil
 	}
 }
 

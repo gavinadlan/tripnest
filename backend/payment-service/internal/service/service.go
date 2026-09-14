@@ -242,6 +242,10 @@ func (s *paymentService) ListPayments(ctx context.Context, status string) ([]mod
 	return s.repo.List(ctx, status)
 }
 
+// errDuplicateWebhook menandai notifikasi yang sudah pernah diproses.
+// Hanya dipakai di dalam HandleWebhook untuk memicu rollback.
+var errDuplicateWebhook = errors.New("webhook duplikat")
+
 func (s *paymentService) HandleWebhook(ctx context.Context, notification model.MidtransNotification) error {
 	if !s.isSignatureValid(notification) {
 		return ErrInvalidSignature
@@ -254,16 +258,36 @@ func (s *paymentService) HandleWebhook(ctx context.Context, notification model.M
 		return nil
 	}
 
+	// Update payment, event outbox, dan catatan idempotensi ditulis dalam
+	// SATU transaksi. Catatan ditulis paling akhir: kalau ternyata sudah
+	// ada, seluruh transaksi di-rollback dan tidak ada efek samping yang
+	// tertinggal. Versi lama menandai lebih dulu -- webhook yang gagal di
+	// tengah tidak pernah bisa diulang Midtrans karena sudah dianggap
+	// selesai.
 	idempotencyKey := notification.OrderID + ":" + notification.TransactionStatus
-	inserted, err := s.repo.MarkWebhookProcessed(ctx, idempotencyKey)
-	if err != nil {
-		return err
-	}
-	if !inserted {
+	err := s.repo.Transact(ctx, func(ctx context.Context) error {
+		if err := s.applyWebhook(ctx, notification); err != nil {
+			return err
+		}
+		inserted, err := s.repo.MarkWebhookProcessed(ctx, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return errDuplicateWebhook
+		}
+		return nil
+	})
+	if errors.Is(err, errDuplicateWebhook) {
 		log.Printf("Duplicate webhook ignored idempotency_key=%s", idempotencyKey)
 		return nil
 	}
+	return err
+}
 
+// applyWebhook menjalankan efek bisnis satu notifikasi. Dipanggil di
+// dalam transaksi HandleWebhook.
+func (s *paymentService) applyWebhook(ctx context.Context, notification model.MidtransNotification) error {
 	status, topic := mapMidtransStatus(notification)
 	if topic == "" {
 		log.Printf(
@@ -300,10 +324,6 @@ func (s *paymentService) HandleWebhook(ctx context.Context, notification model.M
 		Status:        status,
 		TransactionID: payment.TransactionID,
 	}
-
-	// TODO(sprint-3): insert outbox ini harus masuk ke transaksi yang sama
-	// dengan ApplyWebhookResult. Saat ini masih terpisah, jadi masih ada
-	// celah kecil di mana payment terupdate tapi event-nya belum tertulis.
 	if err := s.repo.AddOutboxEvent(ctx, topic, payment.BookingID, event); err != nil {
 		return err
 	}

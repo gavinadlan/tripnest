@@ -3,6 +3,7 @@ package msgbroker
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -16,6 +17,16 @@ func NewProducer(brokers []string) *Producer {
 		writer: &kafka.Writer{
 			Addr:     kafka.TCP(brokers...),
 			Balancer: &kafka.LeastBytes{},
+			// WriteMessages sinkron menunggu batch terisi atau BatchTimeout
+			// lewat. Default 1 detik berarti worker outbox yang mengirim
+			// satu per satu butuh ~1 detik per event -- batch 50 memakan
+			// hampir semenit.
+			BatchTimeout: 10 * time.Millisecond,
+			// kafka.Writer{} default ke RequireNone: WriteMessages kembali
+			// sukses begitu bytes masuk socket, tanpa ack broker. Outbox
+			// yang menandai PUBLISHED atas dasar itu bohong -- broker yang
+			// mati sesaat kemudian tidak pernah punya pesannya.
+			RequiredAcks: kafka.RequireAll,
 			// Topik baru belum tentu sudah ada di broker saat event
 			// pertamanya terbit. Tanpa ini publikasinya gagal terus
 			// dengan "Unknown Topic Or Partition".

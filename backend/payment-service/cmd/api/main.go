@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"github.com/gavinadlan/tripnest/backend/common/auth"
+	"github.com/gavinadlan/tripnest/backend/common/inbox"
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/config"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/db"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/handler"
@@ -23,6 +27,7 @@ import (
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/repository"
 	"github.com/gavinadlan/tripnest/backend/payment-service/internal/service"
 	"github.com/joho/godotenv"
+	"github.com/segmentio/kafka-go"
 )
 
 const paymentConsumerGroup = "payment-service-group"
@@ -47,11 +52,12 @@ func main() {
 
 	db.RunMigrations(cfg.DatabaseURL)
 
-	repo, err := repository.NewPostgresRepository(cfg.DatabaseURL)
+	pool, err := pgtx.NewPool(context.Background(), cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
 	}
-	defer repo.Close()
+	defer pool.Close()
+	repo := repository.NewPostgresRepository(pool)
 
 	producer := msgbroker.NewProducer(cfg.KafkaBrokers)
 	defer producer.Close()
@@ -81,82 +87,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		for {
-			msg, err := consumer.ReadMessage(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				// Jangan break: satu gangguan jaringan sesaat tidak boleh
-				// mematikan consumer sampai container di-restart.
-				log.Printf("Consumer error: %v", err)
-				continue
-			}
-
-			processed, err := repo.MarkMessageProcessed(ctx, paymentConsumerGroup, msg.Topic, string(msg.Key))
-			if err != nil {
-				log.Printf("Failed to mark inventory.reserved message: %v", err)
-				continue
-			}
-			if !processed {
-				continue
-			}
-
-			var event model.BookingEvent
-			if err := json.Unmarshal(msg.Value, &event); err != nil {
-				log.Printf("Failed to unmarshal event: %v", err)
-				continue
-			}
-
-			log.Printf("Kursi tertahan, menyiapkan pembayaran booking_id=%s", event.BookingID)
-			// Dijalankan sinkron dan error-nya diperiksa. Versi lama
-			// memakai `go svc.ProcessPayment(...)` sehingga kegagalan
-			// pembuatan transaksi Snap hilang tanpa jejak.
-			if err := svc.ProcessPayment(ctx, event); err != nil {
-				log.Printf("Gagal menyiapkan pembayaran booking_id=%s: %v", event.BookingID, err)
-			}
+	// Handler jalan di dalam transaksi yang dibuka inbox.Consume; catatan
+	// processed_messages ditulis setelahnya, dalam transaksi yang sama.
+	// Kalau Midtrans atau database sedang tidak bisa dihubungi, pesan
+	// diulang di tempat -- tidak hilang, tidak dilewati.
+	go inbox.Consume(ctx, consumer, pool, paymentConsumerGroup, func(ctx context.Context, msg kafka.Message) error {
+		var event model.BookingEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			return inbox.Permanent(fmt.Errorf("payload inventory.reserved rusak: %w", err))
 		}
-	}()
+		log.Printf("Kursi tertahan, menyiapkan pembayaran booking_id=%s", event.BookingID)
+		return svc.ProcessPayment(ctx, event)
+	})
 
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				outboxEvents, err := repo.FetchPendingOutboxEvents(ctx, 50)
-				if err != nil {
-					log.Printf("Failed to fetch outbox events: %v", err)
-					continue
-				}
-				for _, outboxEvent := range outboxEvents {
-					if strings.TrimSpace(outboxEvent.Key) == "" {
-						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, "empty message key")
-						log.Printf("Skipping outbox event with empty key topic=%s id=%s", outboxEvent.Topic, outboxEvent.ID)
-						continue
-					}
-					var payload map[string]interface{}
-					if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
-						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-						continue
-					}
-					log.Printf("Publishing event to Kafka topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
-					if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
-						_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-						continue
-					}
-					if err := repo.MarkOutboxEventPublished(ctx, outboxEvent.ID); err != nil {
-						log.Printf("Failed to mark outbox event published: %v", err)
-						continue
-					}
-					log.Printf("Published outbox event topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
-				}
-			}
-		}
-	}()
+	go outbox.NewWorker(pool, producer, outbox.ConfigFromEnv()).Run(ctx)
 
 	go func() {
 		log.Printf("Payment service API running on port %s", cfg.Port)

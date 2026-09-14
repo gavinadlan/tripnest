@@ -2,9 +2,10 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -43,38 +44,26 @@ type InventoryRepository interface {
 	ListTrips(ctx context.Context) ([]model.Trip, error)
 	SeedTrips(ctx context.Context) (int, error)
 
-	FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
-	MarkOutboxEventPublished(ctx context.Context, id string) error
-	MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error
-	MarkMessageProcessed(ctx context.Context, consumerGroup, topic, messageKey string) (bool, error)
-	Close()
+	// Transact menjalankan fn dalam satu transaksi. Semua method di atas
+	// yang dipanggil dengan ctx milik fn ikut di dalamnya.
+	Transact(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
 type postgresRepository struct {
 	db *pgxpool.Pool
 }
 
-type OutboxEvent struct {
-	ID      string
-	Topic   string
-	Key     string
-	Payload json.RawMessage
+func NewPostgresRepository(pool *pgxpool.Pool) InventoryRepository {
+	return &postgresRepository{db: pool}
 }
 
-func NewPostgresRepository(connString string) (InventoryRepository, error) {
-	config, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		return nil, err
-	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		return nil, err
-	}
-	return &postgresRepository{db: pool}, nil
+func (r *postgresRepository) Transact(ctx context.Context, fn func(ctx context.Context) error) error {
+	return pgtx.Transact(ctx, r.db, fn)
 }
 
-func (r *postgresRepository) Close() {
-	r.db.Close()
+// q mengembalikan transaksi yang dibawa ctx, atau pool bila tidak ada.
+func (r *postgresRepository) q(ctx context.Context) pgtx.Querier {
+	return pgtx.From(ctx, r.db)
 }
 
 // ReserveSlot menahan kursi untuk sebuah booking.
@@ -85,20 +74,28 @@ func (r *postgresRepository) Close() {
 // untuk membatalkan booking, sehingga tidak ada lagi booking yang lanjut
 // ke pembayaran padahal kursinya sudah habis.
 func (r *postgresRepository) ReserveSlot(ctx context.Context, event model.BookingCreatedEvent) (ReserveOutcome, error) {
+	outcome := ReserveOutcomeRejected
+	err := r.Transact(ctx, func(ctx context.Context) error {
+		var err error
+		outcome, err = r.reserveSlot(ctx, event)
+		return err
+	})
+	return outcome, err
+}
+
+// reserveSlot adalah isi ReserveSlot; berjalan di dalam transaksi yang
+// dibawa ctx. Kalau consumer sudah membuka transaksi (untuk menulis
+// processed_messages bersama efeknya), kita ikut di sana.
+func (r *postgresRepository) reserveSlot(ctx context.Context, event model.BookingCreatedEvent) (ReserveOutcome, error) {
 	bookingID := event.BookingID
 	resourceID := event.ResourceID
 	quantity := event.Seats()
-
-	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return ReserveOutcomeRejected, err
-	}
-	defer tx.Rollback(ctx)
+	tx := r.q(ctx)
 
 	var existingStatus string
-	err = tx.QueryRow(ctx, `SELECT status FROM inventory_reservations WHERE booking_id = $1`, bookingID).Scan(&existingStatus)
+	err := tx.QueryRow(ctx, `SELECT status FROM inventory_reservations WHERE booking_id = $1`, bookingID).Scan(&existingStatus)
 	if err == nil {
-		return ReserveOutcomeDuplicate, tx.Commit(ctx)
+		return ReserveOutcomeDuplicate, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return ReserveOutcomeRejected, err
@@ -128,10 +125,10 @@ func (r *postgresRepository) ReserveSlot(ctx context.Context, event model.Bookin
 			Quantity:   quantity,
 			Reason:     reason,
 		}
-		if err := insertOutbox(ctx, tx, "inventory.rejected", bookingID, rejected); err != nil {
+		if err := outbox.Enqueue(ctx, tx, "inventory.rejected", bookingID, rejected); err != nil {
 			return ReserveOutcomeRejected, err
 		}
-		return ReserveOutcomeRejected, tx.Commit(ctx)
+		return ReserveOutcomeRejected, nil
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -158,18 +155,18 @@ func (r *postgresRepository) ReserveSlot(ctx context.Context, event model.Bookin
 		TotalAmount: event.TotalAmount,
 		ExpiresAt:   event.ExpiresAt,
 	}
-	if err := insertOutbox(ctx, tx, "inventory.reserved", bookingID, reserved); err != nil {
+	if err := outbox.Enqueue(ctx, tx, "inventory.reserved", bookingID, reserved); err != nil {
 		return ReserveOutcomeRejected, err
 	}
 
-	return ReserveOutcomeReserved, tx.Commit(ctx)
+	return ReserveOutcomeReserved, nil
 }
 
 // ConfirmReservation tidak mengubah sisa kursi: kursinya sudah ditahan
 // sejak RESERVED. Yang berubah hanya sifat tahanannya, dari sementara
 // jadi tetap.
 func (r *postgresRepository) ConfirmReservation(ctx context.Context, bookingID string) (bool, error) {
-	tag, err := r.db.Exec(ctx, `
+	tag, err := r.q(ctx).Exec(ctx, `
 		UPDATE inventory_reservations
 		SET status = $1, updated_at = NOW()
 		WHERE booking_id = $2 AND status = $3
@@ -186,15 +183,21 @@ func (r *postgresRepository) ConfirmReservation(ctx context.Context, bookingID s
 // Sebelumnya reservasi CONFIRMED tidak pernah bisa dilepas dengan alasan
 // apa pun, sehingga kursi yang dibatalkan hilang selamanya.
 func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID string, allowConfirmed bool) (bool, error) {
-	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback(ctx)
+	released := false
+	err := r.Transact(ctx, func(ctx context.Context) error {
+		var err error
+		released, err = r.releaseReservation(ctx, bookingID, allowConfirmed)
+		return err
+	})
+	return released, err
+}
+
+func (r *postgresRepository) releaseReservation(ctx context.Context, bookingID string, allowConfirmed bool) (bool, error) {
+	tx := r.q(ctx)
 
 	var resourceID, status string
 	var quantity int
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT resource_id, status, quantity
 		FROM inventory_reservations
 		WHERE booking_id = $1
@@ -208,10 +211,10 @@ func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID s
 	}
 
 	if status == model.ReservationStatusReleased {
-		return false, tx.Commit(ctx)
+		return false, nil
 	}
 	if status == model.ReservationStatusConfirmed && !allowConfirmed {
-		return false, tx.Commit(ctx)
+		return false, nil
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -236,7 +239,7 @@ func (r *postgresRepository) ReleaseReservation(ctx context.Context, bookingID s
 		return false, err
 	}
 
-	return true, tx.Commit(ctx)
+	return true, nil
 }
 
 // UpdateInventory menyesuaikan kapasitas tanpa menyentuh detail trip.
@@ -285,7 +288,7 @@ func (r *postgresRepository) UpdateInventory(ctx context.Context, resourceID str
 
 func (r *postgresRepository) GetInventoryByResourceID(ctx context.Context, resourceID string) (*model.Inventory, error) {
 	var inv model.Inventory
-	err := r.db.QueryRow(ctx, `
+	err := r.q(ctx).QueryRow(ctx, `
 		SELECT
 			i.resource_id,
 			i.total_slots,
@@ -306,7 +309,7 @@ func (r *postgresRepository) GetInventoryByResourceID(ctx context.Context, resou
 }
 
 func (r *postgresRepository) ListInventory(ctx context.Context) ([]model.Inventory, error) {
-	rows, err := r.db.Query(ctx, `
+	rows, err := r.q(ctx).Query(ctx, `
 		SELECT
 			resource_id,
 			total_slots,
@@ -331,72 +334,4 @@ func (r *postgresRepository) ListInventory(ctx context.Context) ([]model.Invento
 		items = append(items, inv)
 	}
 	return items, rows.Err()
-}
-
-// insertOutbox selalu dipanggil dengan transaksi yang juga membawa
-// perubahan datanya. Event dan efeknya lolos atau gagal bersama-sama.
-func insertOutbox(ctx context.Context, tx pgx.Tx, topic, key string, payload any) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox_events (topic, message_key, payload, status, retry_count, created_at, updated_at)
-		VALUES ($1, $2, $3, 'PENDING', 0, NOW(), NOW())
-	`, topic, key, data)
-	return err
-}
-
-func (r *postgresRepository) FetchPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	rows, err := r.db.Query(ctx, `
-		SELECT id, topic, message_key, payload
-		FROM outbox_events
-		WHERE status = 'PENDING'
-		ORDER BY created_at ASC
-		LIMIT $1
-	`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	events := make([]OutboxEvent, 0)
-	for rows.Next() {
-		var evt OutboxEvent
-		if err := rows.Scan(&evt.ID, &evt.Topic, &evt.Key, &evt.Payload); err != nil {
-			return nil, err
-		}
-		events = append(events, evt)
-	}
-	return events, rows.Err()
-}
-
-func (r *postgresRepository) MarkOutboxEventPublished(ctx context.Context, id string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET status = 'PUBLISHED', published_at = NOW(), updated_at = NOW()
-		WHERE id = $1
-	`, id)
-	return err
-}
-
-func (r *postgresRepository) MarkOutboxEventFailed(ctx context.Context, id string, errMsg string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET retry_count = retry_count + 1, last_error = $2, updated_at = NOW()
-		WHERE id = $1
-	`, id, errMsg)
-	return err
-}
-
-func (r *postgresRepository) MarkMessageProcessed(ctx context.Context, consumerGroup, topic, messageKey string) (bool, error) {
-	tag, err := r.db.Exec(ctx, `
-		INSERT INTO processed_messages (consumer_group, topic, message_key, created_at)
-		VALUES ($1, $2, $3, NOW())
-		ON CONFLICT (consumer_group, topic, message_key) DO NOTHING
-	`, consumerGroup, topic, messageKey)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() == 1, nil
 }

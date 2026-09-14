@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 	"github.com/gavinadlan/tripnest/backend/inventory-service/internal/model"
 	"github.com/jackc/pgx/v5"
 )
@@ -156,14 +158,14 @@ func (r *postgresRepository) DeleteTrip(ctx context.Context, id string) error {
 		return ErrTripNotFound
 	}
 
-	if err := insertOutbox(ctx, tx, "trip.deleted", id, model.TripDeletedEvent{ID: id}); err != nil {
+	if err := outbox.Enqueue(ctx, tx, "trip.deleted", id, model.TripDeletedEvent{ID: id}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
 func (r *postgresRepository) GetTrip(ctx context.Context, id string) (*model.Trip, error) {
-	trip, err := readTrip(ctx, r.db, id)
+	trip, err := readTrip(ctx, r.q(ctx), id)
 	if errors.Is(err, ErrTripNotFound) {
 		return nil, nil
 	}
@@ -171,7 +173,7 @@ func (r *postgresRepository) GetTrip(ctx context.Context, id string) (*model.Tri
 }
 
 func (r *postgresRepository) ListTrips(ctx context.Context) ([]model.Trip, error) {
-	rows, err := r.db.Query(ctx, tripSelect+` ORDER BY t.created_at DESC`)
+	rows, err := r.q(ctx).Query(ctx, tripSelect+` ORDER BY t.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +196,7 @@ func (r *postgresRepository) ListTrips(ctx context.Context) ([]model.Trip, error
 // sebagai "Rp 150".
 func (r *postgresRepository) SeedTrips(ctx context.Context) (int, error) {
 	var existing int
-	if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM trips`).Scan(&existing); err != nil {
+	if err := r.q(ctx).QueryRow(ctx, `SELECT COUNT(*) FROM trips`).Scan(&existing); err != nil {
 		return 0, err
 	}
 	if existing > 0 {
@@ -273,7 +275,7 @@ func readTrip(ctx context.Context, q rowQuerier, id string) (*model.Trip, error)
 // Kuncinya penting: ReserveSlot mengunci baris yang sama saat mengurangi
 // stok, jadi keduanya berjalan bergantian, bukan bersamaan di atas
 // hitungan yang sudah basi.
-func lockAndCountReserved(ctx context.Context, tx pgx.Tx, resourceID string) (int, error) {
+func lockAndCountReserved(ctx context.Context, tx pgtx.Querier, resourceID string) (int, error) {
 	var locked string
 	err := tx.QueryRow(ctx, `SELECT resource_id FROM inventory WHERE resource_id = $1 FOR UPDATE`, resourceID).Scan(&locked)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -295,7 +297,7 @@ func lockAndCountReserved(ctx context.Context, tx pgx.Tx, resourceID string) (in
 // enqueueTripUpserted menulis snapshot trip terbaru ke outbox, di dalam
 // transaksi yang mengubahnya. Read model karena itu tidak pernah bisa
 // menerima event untuk perubahan yang ternyata di-rollback.
-func enqueueTripUpserted(ctx context.Context, tx pgx.Tx, tripID string) error {
+func enqueueTripUpserted(ctx context.Context, tx pgtx.Querier, tripID string) error {
 	trip, err := readTrip(ctx, tx, tripID)
 	if err != nil {
 		return err
@@ -310,5 +312,5 @@ func enqueueTripUpserted(ctx context.Context, tx pgx.Tx, tripID string) error {
 		AvailableSlots: trip.AvailableSlots,
 		UpdatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	return insertOutbox(ctx, tx, "trip.upserted", trip.ID, event)
+	return outbox.Enqueue(ctx, tx, "trip.upserted", trip.ID, event)
 }

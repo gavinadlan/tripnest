@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
+	"github.com/segmentio/kafka-go"
 
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/catalog"
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/config"
@@ -26,6 +28,9 @@ import (
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/repository"
 	"github.com/gavinadlan/tripnest/backend/booking-service/internal/service"
 	"github.com/gavinadlan/tripnest/backend/common/auth"
+	"github.com/gavinadlan/tripnest/backend/common/inbox"
+	"github.com/gavinadlan/tripnest/backend/common/outbox"
+	"github.com/gavinadlan/tripnest/backend/common/pgtx"
 )
 
 const (
@@ -47,11 +52,12 @@ func main() {
 
 	db.RunMigrations(cfg.DatabaseURL)
 
-	repo, err := repository.NewPostgresRepository(cfg.DatabaseURL)
+	pool, err := pgtx.NewPool(context.Background(), cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	defer repo.Close()
+	defer pool.Close()
+	repo := repository.NewPostgresRepository(pool)
 
 	producer := events.NewKafkaProducer(cfg.KafkaBrokers)
 	defer producer.Close()
@@ -118,17 +124,37 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go consumePaymentOutcome(ctx, paymentSuccessConsumer, repo, paymentSuccessConsumerGroup, "payment.success", svc.ConfirmBooking)
-	go consumePaymentOutcome(ctx, paymentFailedConsumer, repo, paymentFailedConsumerGroup, "payment.failed",
-		func(ctx context.Context, event model.PaymentProcessedEvent) error {
+	// Setiap handler jalan di dalam transaksi yang dibuka inbox.Consume;
+	// catatan processed_messages ditulis setelah handler, dalam transaksi
+	// yang sama. Handler yang gagal diulang, bukan dilewati.
+	go inbox.Consume(ctx, paymentSuccessConsumer, pool, paymentSuccessConsumerGroup,
+		decode(func(ctx context.Context, event model.PaymentProcessedEvent) error {
+			log.Printf("Received payment.success booking_id=%s status=%s", event.BookingID, event.Status)
+			return svc.ConfirmBooking(ctx, event)
+		}))
+	go inbox.Consume(ctx, paymentFailedConsumer, pool, paymentFailedConsumerGroup,
+		decode(func(ctx context.Context, event model.PaymentProcessedEvent) error {
+			log.Printf("Received payment.failed booking_id=%s status=%s", event.BookingID, event.Status)
 			// Pembatalan tidak butuh detail pembayaran; hanya konfirmasi
 			// yang perlu mencatat nominal saat uangnya jadi yatim.
 			return svc.CancelBooking(ctx, event.BookingID)
-		})
-	go consumeInventoryRejected(ctx, inventoryRejectedConsumer, repo, svc)
-	go consumeInventoryReserved(ctx, inventoryReservedConsumer, repo, svc)
+		}))
+	// Kursi ditolak catalog-service. Kursi tidak perlu dilepas balik:
+	// reservasinya memang tidak pernah terbentuk.
+	go inbox.Consume(ctx, inventoryRejectedConsumer, pool, inventoryRejectedGroup,
+		decode(func(ctx context.Context, event model.InventoryRejectedEvent) error {
+			log.Printf("Kursi ditolak booking_id=%s resource_id=%s reason=%s", event.BookingID, event.ResourceID, event.Reason)
+			return svc.CancelUnseatedBooking(ctx, event.BookingID)
+		}))
+	// Kursi tertahan: satu-satunya jalan dari PENDING_SEAT ke
+	// PENDING_PAYMENT. payment-service mendengarkan topik yang sama.
+	go inbox.Consume(ctx, inventoryReservedConsumer, pool, inventoryReservedGroup,
+		decode(func(ctx context.Context, event model.InventoryReservedEvent) error {
+			log.Printf("Kursi tertahan booking_id=%s resource_id=%s qty=%d", event.BookingID, event.ResourceID, event.Quantity)
+			return svc.MarkSeatReserved(ctx, event)
+		}))
 
-	go runOutboxWorker(ctx, repo, producer)
+	go outbox.NewWorker(pool, producer, outbox.ConfigFromEnv()).Run(ctx)
 	go runExpiryWorker(ctx, svc, cfg.BookingExpiryInterval)
 	go runStuckSeatWorker(ctx, svc)
 
@@ -153,165 +179,16 @@ func main() {
 	log.Println("Server exiting")
 }
 
-// consumePaymentOutcome menangani payment.success dan payment.failed, yang
-// alurnya identik kecuali aksi akhirnya. Sebelumnya dua blok ini disalin
-// hampir sama persis di main.
-func consumePaymentOutcome(
-	ctx context.Context,
-	consumer *events.Consumer,
-	repo repository.BookingRepository,
-	consumerGroup string,
-	topic string,
-	apply func(context.Context, model.PaymentProcessedEvent) error,
-) {
-	log.Printf("Listening for %s events...", topic)
-	for {
-		msg, err := consumer.ReadMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("%s consumer error: %v", topic, err)
-			continue
-		}
-
-		processed, err := repo.MarkMessageProcessed(ctx, consumerGroup, msg.Topic, string(msg.Key))
-		if err != nil {
-			log.Printf("Failed to mark message processed: %v", err)
-			continue
-		}
-		if !processed {
-			continue
-		}
-
-		var event model.PaymentProcessedEvent
+// decode membungkus handler bertipe dengan pembacaan payload. Payload yang
+// tidak bisa di-decode adalah kegagalan permanen: mengulangnya tidak akan
+// mengubah apa pun, jadi pesannya dilewati dan dicatat.
+func decode[T any](apply func(context.Context, T) error) inbox.Handler {
+	return func(ctx context.Context, msg kafka.Message) error {
+		var event T
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			log.Printf("Failed to unmarshal %s event: %v", topic, err)
-			continue
+			return inbox.Permanent(fmt.Errorf("payload %s rusak: %w", msg.Topic, err))
 		}
-
-		log.Printf("Received %s booking_id=%s status=%s", topic, event.BookingID, event.Status)
-		if err := apply(ctx, event); err != nil {
-			log.Printf("Failed to apply %s for booking %s: %v", topic, event.BookingID, err)
-		}
-	}
-}
-
-// consumeInventoryRejected membatalkan booking yang kursinya ditolak
-// catalog-service. Kursi tidak perlu dilepas balik: reservasinya memang
-// tidak pernah terbentuk, jadi tidak ada booking.cancelled di sini.
-func consumeInventoryRejected(
-	ctx context.Context,
-	consumer *events.Consumer,
-	repo repository.BookingRepository,
-	svc service.BookingService,
-) {
-	log.Println("Listening for inventory.rejected events...")
-	for {
-		msg, err := consumer.ReadMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("inventory.rejected consumer error: %v", err)
-			continue
-		}
-
-		processed, err := repo.MarkMessageProcessed(ctx, inventoryRejectedGroup, msg.Topic, string(msg.Key))
-		if err != nil {
-			log.Printf("Failed to mark message processed: %v", err)
-			continue
-		}
-		if !processed {
-			continue
-		}
-
-		var event model.InventoryRejectedEvent
-		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			log.Printf("Failed to unmarshal inventory.rejected event: %v", err)
-			continue
-		}
-
-		log.Printf("Kursi ditolak booking_id=%s resource_id=%s reason=%s", event.BookingID, event.ResourceID, event.Reason)
-		if err := svc.CancelUnseatedBooking(ctx, event.BookingID); err != nil {
-			log.Printf("Failed to cancel rejected booking %s: %v", event.BookingID, err)
-		}
-	}
-}
-
-// consumeInventoryReserved membuka jalan menuju pembayaran. Sebelum event
-// ini datang, booking tidak punya kursi dan tidak boleh punya transaksi
-// Snap -- payment-service mendengarkan topik yang sama, bukan
-// booking.created.
-func consumeInventoryReserved(
-	ctx context.Context,
-	consumer *events.Consumer,
-	repo repository.BookingRepository,
-	svc service.BookingService,
-) {
-	log.Println("Listening for inventory.reserved events...")
-	for {
-		msg, err := consumer.ReadMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("inventory.reserved consumer error: %v", err)
-			continue
-		}
-
-		processed, err := repo.MarkMessageProcessed(ctx, inventoryReservedGroup, msg.Topic, string(msg.Key))
-		if err != nil {
-			log.Printf("Failed to mark message processed: %v", err)
-			continue
-		}
-		if !processed {
-			continue
-		}
-
-		var event model.InventoryReservedEvent
-		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			log.Printf("Failed to unmarshal inventory.reserved event: %v", err)
-			continue
-		}
-
-		log.Printf("Kursi tertahan booking_id=%s resource_id=%s qty=%d", event.BookingID, event.ResourceID, event.Quantity)
-		if err := svc.MarkSeatReserved(ctx, event); err != nil {
-			log.Printf("Failed to mark seat reserved for booking %s: %v", event.BookingID, err)
-		}
-	}
-}
-
-func runOutboxWorker(ctx context.Context, repo repository.BookingRepository, producer *events.KafkaProducer) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			outboxEvents, err := repo.FetchPendingOutboxEvents(ctx, 50)
-			if err != nil {
-				log.Printf("Failed to fetch outbox events: %v", err)
-				continue
-			}
-			for _, outboxEvent := range outboxEvents {
-				var payload map[string]interface{}
-				if err := json.Unmarshal(outboxEvent.Payload, &payload); err != nil {
-					_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-					continue
-				}
-				if err := producer.Publish(ctx, outboxEvent.Topic, outboxEvent.Key, payload); err != nil {
-					_ = repo.MarkOutboxEventFailed(ctx, outboxEvent.ID, err.Error())
-					continue
-				}
-				if err := repo.MarkOutboxEventPublished(ctx, outboxEvent.ID); err != nil {
-					log.Printf("Failed to mark outbox event published: %v", err)
-					continue
-				}
-				log.Printf("Published outbox event topic=%s key=%s", outboxEvent.Topic, outboxEvent.Key)
-			}
-		}
+		return apply(ctx, event)
 	}
 }
 
