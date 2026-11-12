@@ -3,41 +3,44 @@
 import { CalendarDays, MapPin, Users } from 'lucide-react';
 import { Trip } from '@/lib/types';
 import { formatRupiah } from '@/lib/currency';
+import { formatTanggal } from '@/lib/format';
+import { btnPrimary } from '@/lib/ui';
+import TripArt from '@/components/trips/TripArt';
 
-export default function TripCard({
-  trip,
-  onBook,
-  loading,
-}: {
-  trip: Trip;
-  onBook: (trip: Trip) => void;
-  loading?: boolean;
-}) {
+/** Hampir penuh bila tersisa sedikit: maksimal 3 kursi atau 20% dari kapasitas. */
+export function almostFull(trip: Pick<Trip, 'available_slots' | 'total_slots'>): boolean {
+  return trip.available_slots > 0 && (trip.available_slots <= 3 || trip.available_slots <= trip.total_slots * 0.2);
+}
+
+export default function TripCard({ trip, onBook, loading }: { trip: Trip; onBook: (trip: Trip) => void; loading?: boolean }) {
+  const soldOut = trip.available_slots <= 0;
+  const few = almostFull(trip);
+
   return (
-    <article className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md">
-      <div className="mb-4 flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-lg font-semibold text-[var(--color-text-primary)]">{trip.title}</h3>
-          <p className="mt-1 text-sm text-[var(--color-text-secondary)]">{trip.destination}</p>
-        </div>
-        <span className="rounded-lg bg-[var(--color-muted)] px-3 py-1 text-sm font-semibold text-[var(--color-primary)]">
+    <article className="flex h-full flex-col overflow-hidden rounded-2xl border border-garis bg-surface">
+      <div className="relative h-40 overflow-hidden">
+        <TripArt id={trip.id} destination={trip.destination} title={trip.title} className="h-full w-full" />
+        <span className="font-display absolute right-3 top-3 rounded-full bg-amber px-3 py-1 text-sm font-bold text-navy">
           {formatRupiah(trip.price)}
         </span>
+        {soldOut || few ? (
+          <span className={`absolute left-3 top-3 rounded-full px-3 py-1 text-xs font-bold ${soldOut ? 'bg-ink text-white' : 'bg-surface text-warn'}`}>
+            {soldOut ? 'Kursi habis' : 'Hampir penuh'}
+          </span>
+        ) : null}
       </div>
 
-      <div className="space-y-2 text-sm text-[var(--color-text-secondary)]">
-        <p className="flex items-center gap-2"><MapPin className="h-4 w-4" /> {trip.destination}</p>
-        <p className="flex items-center gap-2"><CalendarDays className="h-4 w-4" /> {trip.date}</p>
-        <p className="flex items-center gap-2"><Users className="h-4 w-4" /> Sisa {trip.available_slots} kursi</p>
+      <div className="flex flex-1 flex-col p-5">
+        <h3 className="text-xl font-bold leading-tight text-navy">{trip.title}</h3>
+        <ul className="mt-3 space-y-1.5 text-sm text-ink-soft">
+          <li className="flex items-center gap-2"><MapPin className="h-4 w-4 shrink-0" aria-hidden /> {trip.destination}</li>
+          <li className="flex items-center gap-2"><CalendarDays className="h-4 w-4 shrink-0" aria-hidden /> {formatTanggal(trip.date)}</li>
+          <li className="flex items-center gap-2"><Users className="h-4 w-4 shrink-0" aria-hidden /> Sisa {trip.available_slots} kursi</li>
+        </ul>
+        <button onClick={() => onBook(trip)} disabled={loading || soldOut} className={`${btnPrimary} mt-5 w-full`}>
+          {loading ? 'Membuat booking...' : soldOut ? 'Kursi habis' : 'Pesan trip ini'}
+        </button>
       </div>
-
-      <button
-        onClick={() => onBook(trip)}
-        disabled={loading || trip.available_slots <= 0}
-        className="mt-5 w-full rounded-xl bg-[var(--color-primary)] px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-95 disabled:cursor-not-allowed disabled:bg-slate-300"
-      >
-        {loading ? 'Membuat booking...' : trip.available_slots > 0 ? 'Pesan Trip Ini' : 'Kursi Habis'}
-      </button>
     </article>
   );
 }

@@ -6,6 +6,12 @@ import toast from 'react-hot-toast';
 import { bookingApi, paymentApi } from '@/lib/api';
 import { Booking } from '@/lib/types';
 import { formatRupiah } from '@/lib/currency';
+import { useTrip, tripLabel } from '@/lib/trips';
+import { formatSisa, useCountdown } from '@/lib/countdown';
+import { btnGhost, btnPrimary, card } from '@/lib/ui';
+import { Clock, Lock } from 'lucide-react';
+import TripArt from '@/components/trips/TripArt';
+import MultiStepLoader from '@/components/ui/MultiStepLoader';
 
 const SNAP_SCRIPT_URL =
   process.env.NEXT_PUBLIC_MIDTRANS_SNAP_URL || 'https://app.sandbox.midtrans.com/snap/snap.js';
@@ -45,6 +51,8 @@ export default function PaymentPage() {
   const [waitingSeat, setWaitingSeat] = useState(false);
   const [paying, setPaying] = useState(false);
   const [error, setError] = useState('');
+  const trip = useTrip(booking?.resource_id ?? '');
+  const sisa = useCountdown(booking?.expires_at);
 
   // Muat skrip Snap sekali, dan tandai kapan benar-benar siap dipakai.
   useEffect(() => {
@@ -168,22 +176,17 @@ export default function PaymentPage() {
   }, [snapToken, bookingId, router]);
 
   if (loading) {
-    return <p className="text-[var(--color-text-secondary)]">Memuat...</p>;
+    return <div role="status" aria-label="Memuat" className="mx-auto h-80 max-w-2xl animate-pulse rounded-3xl bg-krem-tua/60" />;
   }
 
   const displayError = CONFIG_ERROR || error;
 
   if (displayError || !booking) {
     return (
-      <section className="mx-auto max-w-2xl rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-sm">
-        <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">Pembayaran</h1>
-        <p className="mt-3 text-sm text-[var(--color-error)]">{displayError || 'Booking tidak ditemukan'}</p>
-        <button
-          onClick={() => router.push('/my-bookings')}
-          className="mt-5 rounded-xl border border-[var(--color-border)] px-4 py-2 text-sm font-medium"
-        >
-          Ke Pesanan Saya
-        </button>
+      <section className={`${card} mx-auto max-w-2xl p-8`}>
+        <h1 className="text-2xl font-bold text-navy">Pembayaran</h1>
+        <p className="mt-3 text-sm font-semibold text-bad">{displayError || 'Booking tidak ditemukan'}</p>
+        <button onClick={() => router.push('/my-bookings')} className={`${btnGhost} mt-5`}>Ke Pesanan Saya</button>
       </section>
     );
   }
@@ -198,48 +201,49 @@ export default function PaymentPage() {
         ? 'Menyiapkan pembayaran...'
         : 'Bayar sekarang';
 
+  const preparing = waitingSeat || !snapToken;
+  const title = tripLabel(trip, booking.resource_id);
+
   return (
-    <section className="mx-auto max-w-2xl rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 shadow-sm">
-      <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">Pembayaran</h1>
-      <p className="mt-2 font-mono text-xs text-[var(--color-text-secondary)]">{booking.id}</p>
-
-      {waitingSeat ? (
-        <div className="mt-5 flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-muted)] p-4">
-          <span
-            aria-hidden
-            className="mt-0.5 h-4 w-4 animate-spin rounded-full border-2 border-[var(--color-primary)] border-t-transparent"
-          />
-          <div className="text-sm">
-            <p className="font-medium text-[var(--color-text-primary)]">Menyiapkan kursi...</p>
-            <p className="mt-1 text-[var(--color-text-secondary)]">
-              Kami sedang memastikan kursimu masih tersedia. Pembayaran baru dibuka setelah kursi
-              benar-benar tertahan, jadi kamu tidak akan membayar untuk kursi yang sudah diambil
-              orang lain.
-            </p>
-          </div>
+    <section className={`${card} mx-auto max-w-2xl overflow-hidden`}>
+      <div className="on-dark relative h-36">
+        <TripArt id={booking.resource_id} destination={trip?.destination ?? ''} title={trip?.title ?? ''} className="h-full w-full" />
+        <div className="absolute inset-0 bg-gradient-to-t from-dark-bg/95 via-dark-bg/75 to-dark-bg/55" />
+        <div className="absolute inset-x-0 bottom-0 p-6 text-white">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-amber">Pembayaran</p>
+          <h1 className="mt-1 text-2xl font-extrabold sm:text-3xl">{title}</h1>
         </div>
-      ) : null}
-
-      <div className="mt-5 space-y-1 text-sm text-[var(--color-text-secondary)]">
-        <p>Trip: {booking.resource_id}</p>
-        <p>Jumlah kursi: {booking.quantity}</p>
-        <p className="text-lg font-semibold text-[var(--color-text-primary)]">
-          Total: {formatRupiah(booking.total_amount)}
-        </p>
-        {booking.expires_at && !waitingSeat ? (
-          <p className="text-xs">
-            Bayar sebelum {new Date(booking.expires_at).toLocaleString('id-ID')}
-          </p>
-        ) : null}
       </div>
 
-      <button
-        onClick={pay}
-        disabled={!canPay}
-        className="mt-6 rounded-xl bg-[var(--color-primary)] px-5 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-300"
-      >
-        {buttonLabel}
-      </button>
+      <div className="p-6 sm:p-8">
+        {preparing ? (
+          <div className="mb-6 rounded-xl bg-krem p-4">
+            <MultiStepLoader steps={['Pesanan dibuat', 'Menahan kursi di katalog', 'Menyiapkan pembayaran']} active={waitingSeat ? 1 : 2} />
+            {waitingSeat ? (
+              <p className="mt-3 text-xs text-ink-soft">
+                Pembayaran baru dibuka setelah kursi benar-benar tertahan, jadi kamu tidak membayar untuk kursi yang sudah diambil orang lain.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        <dl className="space-y-3 text-sm">
+          <div className="flex justify-between gap-4"><dt className="text-ink-soft">Jumlah kursi</dt><dd className="font-semibold text-ink">{booking.quantity}</dd></div>
+          <div className="flex items-end justify-between gap-4 border-t border-garis pt-3"><dt className="text-ink-soft">Total</dt><dd className="font-display text-3xl font-extrabold text-navy">{formatRupiah(booking.total_amount)}</dd></div>
+        </dl>
+
+        {booking.expires_at && !waitingSeat ? (
+          <p className="mt-4 flex items-center gap-2 rounded-xl bg-warn-bg px-4 py-3 text-sm font-semibold text-warn">
+            <Clock className="h-4 w-4" aria-hidden />
+            {sisa === null ? 'Hitung mundur...' : sisa > 0 ? `Bayar dalam ${formatSisa(sisa)}` : 'Batas waktu pembayaran habis'}
+          </p>
+        ) : null}
+
+        <button onClick={pay} disabled={!canPay} className={`${btnPrimary} mt-6 w-full py-3 text-base`}>
+          <Lock className="h-4 w-4" aria-hidden /> {buttonLabel}
+        </button>
+        <p className="mt-3 text-center text-xs text-ink-soft">Pembayaran diproses aman lewat Midtrans.</p>
+      </div>
     </section>
   );
 }

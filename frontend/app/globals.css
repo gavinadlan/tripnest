@@ -1,20 +1,74 @@
 @import "tailwindcss";
 
-:root {
-  --color-primary: #6366f1;
-  --color-background: #f8fafc;
-  --color-surface: #ffffff;
-  --color-muted: #eef2ff;
-  --color-text-primary: #0f172a;
-  --color-text-secondary: #475569;
-  --color-border: #e2e8f0;
-  --color-success: #22c55e;
-  --color-error: #ef4444;
-  --color-warning: #f59e0b;
+@theme {
+  --color-navy: #0b2a4a;
+  --color-biru: #1b5fa8;
+  --color-biru-tua: #154a85;
+  --color-biru-muda: #8ec5ff;
+  --color-amber: #ffb02e;
+  --color-amber-tua: #8a5300;
+  --color-krem: #f7f0e3;
+  --color-krem-tua: #efe5d0;
+  --color-ink: #0a1b2e;
+  --color-ink-soft: #46586b;
+  --color-garis: #e3d9c4;
+  --color-dark-bg: #07182b;
+  --color-surface: #fffdf8;
+
+  --color-ok: #136c3a;
+  --color-ok-bg: #e3f4e8;
+  --color-warn: #8a5300;
+  --color-warn-bg: #fff1cf;
+  --color-bad: #a3202f;
+  --color-bad-bg: #fde6e8;
+  --color-mute: #4a5563;
+  --color-mute-bg: #e8e6e0;
+
+  --font-display: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans Variable", ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  background: var(--color-krem);
 }
 
 body {
-  background: var(--color-background);
-  color: var(--color-text-primary);
-  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--color-krem);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
 }
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+:focus-visible {
+  outline: 3px solid var(--color-biru);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.on-dark :focus-visible {
+  outline-color: var(--color-amber);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes drift {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+@keyframes rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-rise { animation: rise 0.5s ease-out both; }
+.animate-drift { animation: drift 40s linear infinite; }

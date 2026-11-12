@@ -1,23 +1,27 @@
 export default function StatCard({
   label,
   value,
+  hint,
   tone = 'default',
+  className = '',
 }: {
   label: string;
-  value: string | number;
+  value: React.ReactNode;
+  hint?: string;
   tone?: 'default' | 'success' | 'error' | 'warning';
+  className?: string;
 }) {
-  const toneMap: Record<string, string> = {
-    default: 'text-[var(--color-primary)]',
-    success: 'text-[var(--color-success)]',
-    error: 'text-[var(--color-error)]',
-    warning: 'text-[var(--color-warning)]',
+  const toneMap = {
+    default: 'text-navy',
+    success: 'text-ok',
+    error: 'text-bad',
+    warning: 'text-warn',
   };
-
   return (
-    <article className="rounded-2xl border border-[var(--color-border)] bg-white p-5 shadow-sm">
-      <p className="text-sm text-[var(--color-text-secondary)]">{label}</p>
-      <p className={`mt-2 text-3xl font-bold ${toneMap[tone]}`}>{value}</p>
+    <article className={`rounded-2xl border border-garis bg-surface p-5 ${className}`}>
+      <p className="text-sm font-semibold text-ink-soft">{label}</p>
+      <p className={`font-display mt-2 text-5xl font-bold ${toneMap[tone]}`}>{value}</p>
+      {hint ? <p className="mt-2 text-xs text-ink-soft">{hint}</p> : null}
     </article>
   );
 }

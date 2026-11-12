@@ -2,9 +2,15 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { ArrowDown, Search, SearchX } from 'lucide-react';
 import { searchApi } from '@/lib/api';
 import { Trip } from '@/lib/types';
 import TripCard from '@/components/trips/TripCard';
+import TripArt from '@/components/trips/TripArt';
+import HoverGrid from '@/components/ui/HoverGrid';
+import BlurText from '@/components/ui/BlurText';
+import MovingBorder from '@/components/ui/MovingBorder';
+import { btnAmber, btnGhost, input } from '@/lib/ui';
 import toast from 'react-hot-toast';
 
 const PAGE_SIZE = 9;
@@ -28,9 +34,7 @@ export default function HomePage() {
     let cancelled = false;
     setLoading(true);
 
-    // Penyaringan dan paginasi dikerjakan server. Sebelumnya seluruh trip
-    // ditarik sekaligus lalu disaring di browser, jadi parameter /search
-    // yang sudah ada tidak pernah terpakai.
+    // Penyaringan dan paginasi dikerjakan server lewat /search.
     void (async () => {
       try {
         const res = await searchApi.get('/search', {
@@ -62,7 +66,16 @@ export default function HomePage() {
     setFilters({ destination: destinationInput.trim(), minPrice: minPriceInput, maxPrice: maxPriceInput });
   };
 
+  const resetFilters = () => {
+    setDestinationInput('');
+    setMinPriceInput('');
+    setMaxPriceInput('');
+    setPage(1);
+    setFilters({ destination: '', minPrice: '', maxPrice: '' });
+  };
+
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const filtering = Boolean(filters.destination || filters.minPrice || filters.maxPrice);
 
   const onBook = (trip: Trip) => {
     setBookingTripId(trip.id);
@@ -72,83 +85,88 @@ export default function HomePage() {
   };
 
   return (
-    <section className="space-y-8">
-      <div className="rounded-3xl bg-gradient-to-r from-[var(--color-muted)] to-white p-8 shadow-sm">
-        <p className="text-sm font-medium text-[var(--color-primary)]">Temukan Perjalanan Impianmu</p>
-        <h1 className="mt-2 text-4xl font-bold text-[var(--color-text-primary)]">Booking travel modern, cepat, dan aman.</h1>
-        <p className="mt-3 max-w-2xl text-[var(--color-text-secondary)]">
-          Jelajahi trip yang tersedia, booking dalam hitungan detik, lalu selesaikan pembayaran aman lewat Midtrans.
-        </p>
-        <form
-          className="mt-6 flex flex-wrap items-end gap-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            applyFilters();
-          }}
-        >
-          <input
-            value={destinationInput}
-            onChange={(e) => setDestinationInput(e.target.value)}
-            placeholder="Cari destinasi"
-            className="w-full max-w-xs rounded-xl border border-[var(--color-border)] bg-white px-4 py-2.5 text-sm text-[var(--color-text-primary)] outline-none ring-[var(--color-primary)]/20 focus:ring-4"
-          />
-          <input
-            type="number"
-            min={0}
-            value={minPriceInput}
-            onChange={(e) => setMinPriceInput(e.target.value)}
-            placeholder="Harga minimum"
-            className="w-40 rounded-xl border border-[var(--color-border)] bg-white px-4 py-2.5 text-sm text-[var(--color-text-primary)] outline-none ring-[var(--color-primary)]/20 focus:ring-4"
-          />
-          <input
-            type="number"
-            min={0}
-            value={maxPriceInput}
-            onChange={(e) => setMaxPriceInput(e.target.value)}
-            placeholder="Harga maksimum"
-            className="w-40 rounded-xl border border-[var(--color-border)] bg-white px-4 py-2.5 text-sm text-[var(--color-text-primary)] outline-none ring-[var(--color-primary)]/20 focus:ring-4"
-          />
-          <button type="submit" className="rounded-xl bg-[var(--color-primary)] px-5 py-2.5 text-sm font-semibold text-white">
-            Cari
-          </button>
-        </form>
+    <section className="space-y-10">
+      <div className="on-dark relative overflow-hidden rounded-3xl bg-dark-bg text-white">
+        <div aria-hidden className="absolute inset-y-0 right-0 hidden w-3/5 md:block">
+          <TripArt id="hero-tripnest-senja" destination="Bali" title="Sunset" className="h-full w-full opacity-90" />
+          <div className="absolute inset-0 bg-gradient-to-r from-dark-bg via-dark-bg/70 to-transparent" />
+        </div>
+        <div className="relative px-6 py-12 sm:px-10 sm:py-16">
+          <p className="text-sm font-bold uppercase tracking-[0.2em] text-amber">Temukan perjalanan impianmu</p>
+          <h1 className="mt-3 max-w-2xl text-4xl font-extrabold leading-[1.05] sm:text-6xl">
+            <BlurText text="Pesan trip, pastikan kursimu aman." />
+          </h1>
+          <p className="mt-4 max-w-xl text-lg text-white/85">
+            Jelajahi trip yang tersedia, pesan dalam hitungan detik, lalu bayar lewat Midtrans. Kursi baru dikunci setelah dipastikan tersedia.
+          </p>
+
+          <form
+            className="mt-8 grid max-w-3xl gap-3 sm:grid-cols-[1.6fr_1fr_1fr_auto]"
+            onSubmit={(e) => {
+              e.preventDefault();
+              applyFilters();
+            }}
+            role="search"
+            aria-label="Cari trip"
+          >
+            <input aria-label="Destinasi" value={destinationInput} onChange={(e) => setDestinationInput(e.target.value)} placeholder="Cari destinasi" className={input} />
+            <input aria-label="Harga minimum" type="number" min={0} value={minPriceInput} onChange={(e) => setMinPriceInput(e.target.value)} placeholder="Harga minimum" className={input} />
+            <input aria-label="Harga maksimum" type="number" min={0} value={maxPriceInput} onChange={(e) => setMaxPriceInput(e.target.value)} placeholder="Harga maksimum" className={input} />
+            <button type="submit" className={btnAmber}>
+              <Search className="h-4 w-4" aria-hidden /> Cari
+            </button>
+          </form>
+
+          <div className="mt-6">
+            <MovingBorder>
+              <a href="#daftar-trip" className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-white">
+                Lihat semua trip <ArrowDown className="h-4 w-4" aria-hidden />
+              </a>
+            </MovingBorder>
+          </div>
+        </div>
       </div>
 
-      {loading ? (
-        <p className="text-[var(--color-text-secondary)]">Memuat daftar trip...</p>
-      ) : trips.length === 0 ? (
-        <p className="text-[var(--color-text-secondary)]">Tidak ada trip yang cocok dengan pencarianmu.</p>
-      ) : (
-        <>
-          <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-            {trips.map((trip) => (
-              <TripCard key={trip.id} trip={trip} onBook={onBook} loading={bookingTripId === trip.id} />
+      <div id="daftar-trip" className="scroll-mt-24">
+        {loading ? (
+          <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3" role="status" aria-label="Memuat daftar trip">
+            {Array.from({ length: 6 }, (_, i) => (
+              <div key={i} className="h-[22rem] animate-pulse rounded-2xl border border-garis bg-krem-tua/60" />
             ))}
           </div>
-
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-[var(--color-text-secondary)]">
-              Halaman {page} dari {totalPages} &middot; {total} trip
+        ) : trips.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-garis bg-surface px-6 py-14 text-center">
+            <SearchX className="mx-auto h-10 w-10 text-ink-soft" aria-hidden />
+            <h2 className="mt-4 text-2xl font-bold text-navy">Belum ada trip yang cocok</h2>
+            <p className="mx-auto mt-2 max-w-md text-ink-soft">
+              {filtering ? 'Coba ganti destinasi atau longgarkan rentang harga.' : 'Daftar trip masih kosong. Cek lagi sebentar lagi.'}
             </p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={page <= 1}
-                className="rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-sm disabled:opacity-40"
-              >
-                Sebelumnya
-              </button>
-              <button
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                disabled={page >= totalPages}
-                className="rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-sm disabled:opacity-40"
-              >
-                Berikutnya
-              </button>
-            </div>
+            {filtering ? (
+              <button onClick={resetFilters} className={`${btnGhost} mt-5`}>Hapus filter</button>
+            ) : null}
           </div>
-        </>
-      )}
+        ) : (
+          <>
+            <HoverGrid
+              className="-m-2 grid md:grid-cols-2 xl:grid-cols-3"
+              items={trips.map((trip) => ({
+                key: trip.id,
+                node: <TripCard trip={trip} onBook={onBook} loading={bookingTripId === trip.id} />,
+              }))}
+            />
+
+            <div className="mt-8 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-ink-soft">
+                Halaman {page} dari {totalPages} &middot; {total} trip
+              </p>
+              <div className="flex gap-2">
+                <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} className={btnGhost}>Sebelumnya</button>
+                <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className={btnGhost}>Berikutnya</button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
     </section>
   );
 }

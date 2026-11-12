@@ -6,9 +6,9 @@ import Footer from '@/components/Footer';
 
 export default function AppChrome({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isAdmin = pathname.startsWith('/admin');
 
-  if (isAdmin) {
+  // Area admin punya kerangka sendiri (app/admin/layout.tsx).
+  if (pathname.startsWith('/admin')) {
     return <>{children}</>;
   }
 

@@ -3,6 +3,9 @@
 import { useEffect, useState } from 'react';
 import { adminInventoryApi } from '@/lib/adminApi';
 import toast from 'react-hot-toast';
+import { idPendek } from '@/lib/format';
+import { tripLabel, useTrips } from '@/lib/trips';
+import { btnGhost, btnSmall, input, tableWrap, td, th } from '@/lib/ui';
 
 type Inventory = {
   resource_id: string;
@@ -13,110 +16,85 @@ type Inventory = {
 
 export default function AdminInventoryPage() {
   const [items, setItems] = useState<Inventory[]>([]);
-  const [resourceId, setResourceId] = useState('');
-  const [totalSlots, setTotalSlots] = useState(0);
   const [editing, setEditing] = useState<Record<string, number>>({});
+  const trips = useTrips(items.map((i) => i.resource_id));
+
+  const load = async () => {
+    const res = await adminInventoryApi.get('/inventory');
+    setItems(res.data.data || res.data || []);
+  };
 
   useEffect(() => {
     void (async () => {
       try {
-        const res = await adminInventoryApi.get('/inventory');
-        setItems(res.data.data || res.data || []);
+        await load();
       } catch {
         toast.error('Gagal memuat inventaris');
       }
     })();
   }, []);
 
-  const createInventory = async () => {
-    try {
-      await adminInventoryApi.post('/inventory', {
-        resource_id: resourceId,
-        total_slots: totalSlots,
-      });
-      toast.success('Inventaris berhasil dibuat');
-      setResourceId('');
-      setTotalSlots(0);
-      const res = await adminInventoryApi.get('/inventory');
-      setItems(res.data.data || res.data || []);
-    } catch {
-      toast.error('Gagal membuat inventaris');
-    }
-  };
-
   const updateInventory = async (id: string) => {
     try {
       await adminInventoryApi.patch(`/inventory/${id}`, { total_slots: editing[id] });
       toast.success('Inventaris berhasil diperbarui');
-      const res = await adminInventoryApi.get('/inventory');
-      setItems(res.data.data || res.data || []);
+      await load();
     } catch {
       toast.error('Gagal memperbarui inventaris');
     }
   };
 
   return (
-    <section className="space-y-5">
-      <div className="rounded-2xl border border-[var(--color-border)] bg-white p-4 shadow-sm">
-        <h2 className="mb-3 text-base font-semibold text-[var(--color-text-primary)]">Buat Inventaris</h2>
-        <div className="flex flex-wrap gap-3">
-          <input
-            placeholder="resource_id trip"
-            value={resourceId}
-            onChange={(e) => setResourceId(e.target.value)}
-            className="rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm"
-          />
-          <input
-            type="number"
-            placeholder="total slot"
-            value={totalSlots}
-            onChange={(e) => setTotalSlots(Number(e.target.value))}
-            className="w-40 rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm"
-          />
-          <button onClick={createInventory} className="rounded-lg bg-[var(--color-primary)] px-4 py-2 text-sm font-semibold text-white">
-            Buat
-          </button>
-        </div>
-      </div>
-
-      <div className="overflow-hidden rounded-2xl border border-[var(--color-border)] bg-white shadow-sm">
+    <section className="space-y-4">
+      <p className="max-w-2xl text-sm text-ink-soft">
+        Kapasitas dibuat bersama trip di halaman Trip. Di sini kamu hanya bisa menyesuaikan total kursi trip yang sudah ada.
+      </p>
+      <div className={tableWrap}>
         <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-left text-[var(--color-text-secondary)]">
+          <thead className="bg-krem/70">
             <tr>
-              <th className="px-4 py-3 font-medium">ID Resource</th>
-              <th className="px-4 py-3 font-medium">Total Slot</th>
-              <th className="px-4 py-3 font-medium">Slot Tersedia</th>
-              <th className="px-4 py-3 font-medium">Slot Dipesan</th>
-              <th className="px-4 py-3 font-medium">Aksi</th>
+              <th className={th}>Trip</th>
+              <th className={th}>Total kursi</th>
+              <th className={th}>Terisi</th>
+              <th className={th}>Tersedia</th>
+              <th className={th}>Dipesan</th>
+              <th className={th}>Aksi</th>
             </tr>
           </thead>
           <tbody>
             {items.map((item) => {
               const key = item.resource_id;
+              const used = item.total_slots ? ((item.total_slots - item.available_slots) / item.total_slots) * 100 : 0;
               return (
-                <tr key={key} className="border-t border-[var(--color-border)]">
-                  <td className="px-4 py-3">{item.resource_id}</td>
-                  <td className="px-4 py-3">
+                <tr key={key} className="border-t border-garis">
+                  <td className={`${td} font-semibold text-navy`} title={`ID ${idPendek(key)}`}>{tripLabel(trips[key], key)}</td>
+                  <td className={td}>
+                    <label className="sr-only" htmlFor={`slot-${key}`}>Total kursi</label>
                     <input
+                      id={`slot-${key}`}
                       type="number"
+                      min={1}
                       value={editing[key] ?? item.total_slots}
                       onChange={(e) => setEditing((prev) => ({ ...prev, [key]: Number(e.target.value) }))}
-                      className="w-24 rounded-md border border-[var(--color-border)] px-2 py-1 text-xs"
+                      className={`${input} !w-24 !px-3 !py-1.5`}
                     />
                   </td>
-                  <td className="px-4 py-3">{item.available_slots}</td>
-                  <td className="px-4 py-3">{item.reserved_slots}</td>
-                  <td className="px-4 py-3">
-                    <button
-                      onClick={() => updateInventory(item.resource_id)}
-                      className="rounded-md border border-[var(--color-border)] px-2 py-1 text-xs"
-                    >
-                      Simpan
-                    </button>
+                  <td className={`${td} min-w-32`}>
+                    <div className="h-2 rounded-full bg-krem-tua" role="img" aria-label={`${Math.round(used)}% terisi`}>
+                      <div className={`h-2 rounded-full ${used >= 90 ? 'bg-bad' : used >= 70 ? 'bg-amber' : 'bg-biru'}`} style={{ width: `${used}%` }} />
+                    </div>
+                  </td>
+                  <td className={td}>{item.available_slots}</td>
+                  <td className={td}>{item.reserved_slots}</td>
+                  <td className={td}>
+                    <button onClick={() => updateInventory(item.resource_id)} className={`${btnGhost} ${btnSmall}`}>Simpan</button>
                   </td>
                 </tr>
               );
             })}
+            {items.length === 0 ? (
+              <tr><td colSpan={6} className="px-4 py-10 text-center text-ink-soft">Belum ada data inventaris.</td></tr>
+            ) : null}
           </tbody>
         </table>
       </div>

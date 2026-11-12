@@ -5,6 +5,9 @@ import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 import { userApi } from '@/lib/api';
 import { decodeToken, setToken, clearToken } from '@/lib/auth';
+import { btnPrimary, input } from '@/lib/ui';
+import Logo from '@/components/Logo';
+import { ShieldCheck } from 'lucide-react';
 
 /**
  * Login admin memakai endpoint yang sama dengan login user biasa.
@@ -24,12 +27,12 @@ export default function AdminLoginPage() {
     e.preventDefault();
 
     if (!email.trim() || !password) {
-      toast.error('Email dan password wajib diisi');
+      toast.error('Email dan kata sandi wajib diisi');
       return;
     }
 
     setLoading(true);
-    const loadingToast = toast.loading('Memeriksa kredensial...');
+    const loadingToast = toast.loading('Memeriksa akun...');
 
     try {
       const response = await userApi.post('/login', { email: email.trim(), password });
@@ -50,7 +53,7 @@ export default function AdminLoginPage() {
         typeof error === 'object' && error !== null && 'response' in error
           ? (error as { response?: { status?: number } }).response?.status
           : undefined;
-      toast.error(status === 401 ? 'Kredensial tidak valid' : 'Gagal masuk, coba lagi', {
+      toast.error(status === 401 ? 'Email atau kata sandi salah' : 'Gagal masuk, coba lagi', {
         id: loadingToast,
       });
       setLoading(false);
@@ -58,42 +61,25 @@ export default function AdminLoginPage() {
   };
 
   return (
-    <section className="flex min-h-screen items-center justify-center bg-[var(--color-background)] p-4">
-      <div className="w-full max-w-md rounded-2xl border border-[var(--color-border)] bg-white p-6 shadow-sm">
-        <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">Login Admin</h1>
-        <p className="mt-2 text-sm text-[var(--color-text-secondary)]">
-          Masuk dengan akun yang punya role admin.
-        </p>
+    <section className="on-dark flex min-h-screen items-center justify-center bg-dark-bg p-4">
+      <div className="w-full max-w-md rounded-2xl border border-white/10 bg-surface p-8 shadow-2xl">
+        <Logo className="h-8" href={null} />
+        <h1 className="mt-6 flex items-center gap-2 text-2xl font-extrabold text-navy">
+          <ShieldCheck className="h-6 w-6 text-biru" aria-hidden /> Masuk admin
+        </h1>
+        <p className="mt-2 text-sm text-ink-soft">Gunakan akun yang memiliki peran admin.</p>
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-4">
           <div>
-            <label className="mb-1 block text-sm font-medium text-[var(--color-text-primary)]">Email</label>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="email"
-              className="w-full rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm"
-              placeholder="admin@tripnest.local"
-            />
+            <label htmlFor="email" className="mb-1.5 block text-sm font-semibold text-ink">Email</label>
+            <input id="email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" className={input} placeholder="admin@email.com" />
           </div>
           <div>
-            <label className="mb-1 block text-sm font-medium text-[var(--color-text-primary)]">Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="current-password"
-              className="w-full rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm"
-              placeholder="••••••••"
-            />
+            <label htmlFor="password" className="mb-1.5 block text-sm font-semibold text-ink">Kata sandi</label>
+            <input id="password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" className={input} placeholder="Masukkan kata sandi" />
           </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-lg bg-[var(--color-primary)] px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60"
-          >
-            {loading ? 'Memproses...' : 'Masuk Admin'}
+          <button type="submit" disabled={loading} className={`${btnPrimary} w-full py-3`}>
+            {loading ? 'Memproses...' : 'Masuk admin'}
           </button>
         </form>
       </div>

@@ -2,31 +2,33 @@
 
 type Status = 'PENDING_SEAT' | 'PENDING_PAYMENT' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED' | 'FAILED' | string;
 
-const statusStyles: Record<string, string> = {
-  PENDING_SEAT: 'bg-sky-50 text-sky-700 border-sky-200',
-  PENDING_PAYMENT: 'bg-amber-50 text-amber-700 border-amber-200',
-  CONFIRMED: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-  CANCELLED: 'bg-rose-50 text-rose-700 border-rose-200',
-  EXPIRED: 'bg-slate-100 text-slate-700 border-slate-200',
-  FAILED: 'bg-rose-50 text-rose-700 border-rose-200',
+const styles: Record<string, string> = {
+  PENDING_SEAT: 'bg-biru-muda/30 text-navy border-biru/30',
+  PENDING_PAYMENT: 'bg-warn-bg text-warn border-amber/60',
+  PENDING: 'bg-warn-bg text-warn border-amber/60',
+  CONFIRMED: 'bg-ok-bg text-ok border-ok/30',
+  SUCCESS: 'bg-ok-bg text-ok border-ok/30',
+  CANCELLED: 'bg-bad-bg text-bad border-bad/30',
+  FAILED: 'bg-bad-bg text-bad border-bad/30',
+  EXPIRED: 'bg-mute-bg text-mute border-mute/30',
+};
+
+export const STATUS_LABEL: Record<string, string> = {
+  PENDING_SEAT: 'Menahan kursi',
+  PENDING_PAYMENT: 'Menunggu pembayaran',
+  CONFIRMED: 'Terkonfirmasi',
+  CANCELLED: 'Dibatalkan',
+  EXPIRED: 'Kedaluwarsa',
+  FAILED: 'Gagal',
+  SUCCESS: 'Berhasil',
+  PENDING: 'Menunggu',
 };
 
 export default function StatusBadge({ status }: { status: Status }) {
-  const labels: Record<string, string> = {
-    PENDING_SEAT: 'Menyiapkan Kursi',
-    PENDING_PAYMENT: 'Menunggu Pembayaran',
-    CONFIRMED: 'Terkonfirmasi',
-    CANCELLED: 'Dibatalkan',
-    EXPIRED: 'Kedaluwarsa',
-    FAILED: 'Gagal',
-    SUCCESS: 'Berhasil',
-    PENDING: 'Menunggu',
-  };
-  const label = labels[status] || status.replaceAll('_', ' ');
-  const style = statusStyles[status] || 'bg-indigo-50 text-indigo-700 border-indigo-200';
-
+  const label = STATUS_LABEL[status] || status.replaceAll('_', ' ');
+  const style = styles[status] || 'bg-krem-tua text-ink border-garis';
   return (
-    <span className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${style}`}>
+    <span className={`inline-flex items-center whitespace-nowrap rounded-full border px-3 py-1 text-xs font-semibold ${style}`}>
       {label}
     </span>
   );
